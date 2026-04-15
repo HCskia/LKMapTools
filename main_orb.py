@@ -19,26 +19,18 @@ import sys
 DEBUG_MODE = config.DEBUGMODE
 MIN_MATCH_COUNT = config.ORB_MIN_MATCH_COUNT  # 增加最小匹配数要求
 CONFIG_FILE = "config.json"
+MATCHTYPE = config.MATCHTYPE
 selector_event = threading.Event()
 
-def super_enhance(image, isPlayer=False):
-    # # 转为灰度
-    # gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    #
-    # if isPlayer:
-    #     # 1. 遮挡中心，防止玩家图标干扰
-    #     h, w = gray.shape
-    #     cv2.circle(gray, (w // 2, h // 2), 22, 0, -1)
-    #
-    # # 这会把草地的微小纹理变成亮线
-    # laplacian = cv2.Laplacian(gray, cv2.CV_8U, ksize=3)
-    # # 将原始灰度图与边缘图混合，增强对比度
-    # enhanced = cv2.addWeighted(gray, 0.7, laplacian, 0.3, 0)
-    #
-    # # 3. 强力 CLAHE 再次拉开差距
-    # clahe = cv2.createCLAHE(clipLimit=5.0, tileGridSize=(8, 8))
-    # return clahe.apply(enhanced)
-    return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+def super_enhance(image, isPlayer=False): #return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    # 转为灰度
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    alpha = 1.2  # 对比度系数
+    beta = -40  # 亮度偏移
+    enhanced = cv2.convertScaleAbs(gray, alpha=alpha, beta=beta)
+    return enhanced
+
 
 class BigMapWindow(tk.Toplevel):
     def __init__(self, master, map_img, markers, icon_cache):
@@ -50,11 +42,31 @@ class BigMapWindow(tk.Toplevel):
         self.markers = markers
         self.icon_cache = icon_cache
 
+        # 烘焙原尺寸大图 (包含图标)
         self.baked_full_image = self.bake_static_map()
+        self.orig_w, self.orig_h = self.baked_full_image.size
 
+        # 生成缩略图缓存 (用于极度缩小的情况，提升画质和性能)
+        # 设定缩略图最大边长为 2048
+        thumb_ratio = min(2048 / self.orig_w, 2048 / self.orig_h)
+        if thumb_ratio < 1.0:
+            self.thumbnail_img = self.baked_full_image.resize(
+                (int(self.orig_w * thumb_ratio), int(self.orig_h * thumb_ratio)),
+                Image.Resampling.BILINEAR
+            )
+            self.thumb_scale_factor = thumb_ratio
+        else:
+            self.thumbnail_img = self.baked_full_image
+            self.thumb_scale_factor = 1.0
+
+        self.is_dragging = False  # 初始化拖拽状态
         self.scale = 0.2  # 初始缩放比例（全图通常很大，默认缩小显示）
         self.offset_x = 0
         self.offset_y = 0
+
+        # 将视角居中
+        self.offset_x = (self.winfo_width() - self.orig_w * self.scale) / 2
+        self.offset_y = (self.winfo_height() - self.orig_h * self.scale) / 2
 
         self.canvas = tk.Canvas(self, bg='#1a1a1a', cursor="fleur")
         self.canvas.pack(fill=tk.BOTH, expand=True)
@@ -64,6 +76,9 @@ class BigMapWindow(tk.Toplevel):
         self.canvas.bind("<ButtonPress-1>", self.on_drag_start)
         self.canvas.bind("<B1-Motion>", self.on_drag_move)
         self.canvas.bind("<ButtonRelease-1>", self.on_drag_release)
+
+        # 窗口大小改变时重新渲染
+        self.bind("<Configure>", lambda e: self.render())
 
         self.after(300, self.render) # 绘制刷新时间
 
@@ -78,7 +93,7 @@ class BigMapWindow(tk.Toplevel):
             if not icon_set: continue
 
             # 根据状态选择图标
-            icon = icon_set["gray"] if m.get('is_collected') else icon_set["normal"]
+            icon = icon_set["pil_gray"] if m.get('is_collected') else icon_set["pil_normal"]
 
             # 计算粘贴位置 (图标中心点对齐地图坐标)
             ix, iy = m['pixel_x'], m['pixel_y']
@@ -93,22 +108,69 @@ class BigMapWindow(tk.Toplevel):
         return working_img
 
     def render(self):
-        """现在的渲染极其简单：只处理一张图"""
-        self.canvas.delete("all")
+        """视口裁剪算法：只计算并渲染当前屏幕可见的区域"""
 
-        # 1. 计算当前缩放尺寸
-        w, h = self.baked_full_image.size
-        sw, sh = int(w * self.scale), int(h * self.scale)
+        # 确保必要属性已加载
+        if not hasattr(self, 'canvas') or not hasattr(self, 'is_dragging'):
+            return
 
-        # 2. 缩放预烘焙好的大图
-        # 如果缩放很小，NEAREST 速度最快；缩放很大，BILINEAR 画质好
-        resample_mode = Image.Resampling.NEAREST if self.scale < 0.5 else Image.Resampling.BILINEAR
+        cw = self.canvas.winfo_width()
+        ch = self.canvas.winfo_height()
+        if cw <= 10 or ch <= 10: return
 
-        # 性能进阶：如果地图极大(例如8k)，这里应该先 Crop 再 Resize
-        display_img = self.baked_full_image.resize((sw, sh), resample_mode)
+        # 计算当前窗口在【原始大图】坐标系下的 Bounding Box
+        # offset_x 是画板左上角相对于原图起点的偏移
+        left = -self.offset_x / self.scale
+        top = -self.offset_y / self.scale
+        right = left + (cw / self.scale)
+        bottom = top + (ch / self.scale)
+
+        # 根据缩放比例决定使用原图还是缩略图来裁剪
+        # 当缩放比例很小时，原图裁剪会导致锯齿，且范围过大。此时使用缩略图
+        use_thumbnail = self.scale < (self.thumb_scale_factor * 1.5)
+
+        if use_thumbnail:
+            source_img = self.thumbnail_img
+            # 将坐标系转换到缩略图的尺度
+            left *= self.thumb_scale_factor
+            top *= self.thumb_scale_factor
+            right *= self.thumb_scale_factor
+            bottom *= self.thumb_scale_factor
+        else:
+            source_img = self.baked_full_image
+
+        # 边界限制处理
+        src_w, src_h = source_img.size
+        crop_left = max(0, int(left))
+        crop_top = max(0, int(top))
+        crop_right = min(src_w, int(right))
+        crop_bottom = min(src_h, int(bottom))
+
+        # 如果画面完全不在视野内，清空画布并跳过
+        if crop_left >= src_w or crop_top >= src_h or crop_right <= 0 or crop_bottom <= 0:
+            self.canvas.delete("map_img")
+            return
+
+        # 执行裁剪 (极速操作)
+        cropped_img = source_img.crop((crop_left, crop_top, crop_right, crop_bottom))
+
+        # 计算裁剪后的图像在屏幕上应该显示的尺寸和位置
+        # 由于边界限制，裁剪的区域可能比窗口小，需要算出它在屏幕上的精确绘制起点
+        draw_w = int((crop_right - crop_left) * (self.scale / (self.thumb_scale_factor if use_thumbnail else 1.0)))
+        draw_h = int((crop_bottom - crop_top) * (self.scale / (self.thumb_scale_factor if use_thumbnail else 1.0)))
+
+        # 计算在 Canvas 上的绘制起点
+        draw_x = max(0, self.offset_x)
+        draw_y = max(0, self.offset_y)
+
+        # 最终缩放并推送到 UI
+        is_dragging = getattr(self, 'is_dragging', False)
+        resample_mode = Image.Resampling.NEAREST if self.is_dragging else Image.Resampling.BILINEAR
+        display_img = cropped_img.resize((draw_w, draw_h), resample_mode)
 
         self.tk_img = ImageTk.PhotoImage(display_img)
-        self.canvas.create_image(self.offset_x, self.offset_y, anchor=tk.NW, image=self.tk_img)
+        self.canvas.delete("map_img")
+        self.canvas.create_image(draw_x, draw_y, anchor=tk.NW, image=self.tk_img, tags="map_img")
 
     def on_zoom(self, event):
         """以鼠标位置为中心的缩放算法"""
@@ -244,6 +306,8 @@ class MapTrackerApp:
         self.consecutive_failures = 0  # 连续失败计数
         self.global_search_threshold = 10  # 超过10次失败就全球搜索
         self.found = False
+        self.canvas_icons = {}  # 记录标记点对应的 Canvas ID
+        self.bg_image_id = None  # 记录底图的 Canvas ID
         # -- UI平滑移动参数
         self.smooth_x = None
         self.smooth_y = None
@@ -293,7 +357,18 @@ class MapTrackerApp:
             edgeThreshold=1
         )
 
-        self.bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)  # BF初始化
+
+        if MATCHTYPE == "BF":
+            self.bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)  # BF初始化
+        elif MATCHTYPE == "FLANN":
+            index_params = dict(
+                algorithm=6,
+                table_number=6,
+                key_size=12,
+                multi_probe_level=1
+            )
+            search_params = dict(checks=50)
+            self.flann = cv2.FlannBasedMatcher(index_params, search_params)
 
         self.clahe = cv2.createCLAHE(
             clipLimit=getattr(config, 'ORB_CLAHE_LIMIT', config.ORB_CLIPLIMIT),
@@ -385,45 +460,65 @@ class MapTrackerApp:
                 x1, y1 = center_x - half_view, center_y - half_view
                 x2, y2 = center_x + half_view, center_y + half_view
 
-                # 1. 裁剪底图
+                # 裁剪底图
                 display_crop = self.logic_map_bgr[max(0,y1):min(self.map_height,y2),
                                                   max(0,x1):min(self.map_width,x2)].copy()
-                # 2. 动态叠加图标
-                pil_img = Image.fromarray(cv2.cvtColor(display_crop, cv2.COLOR_BGR2RGB))
+                pil_bg = Image.fromarray(cv2.cvtColor(display_crop, cv2.COLOR_BGR2RGB))
+                self.tk_bg_image = ImageTk.PhotoImage(pil_bg)
 
+                # 更新底层背景图片（如果不存在则创建）
+                if not hasattr(self, 'bg_image_id') or self.bg_image_id is None:
+                    self.bg_image_id = self.canvas.create_image(0, 0, anchor=tk.NW, image=self.tk_bg_image)
+                    self.canvas.tag_lower(self.bg_image_id)  # 确保底图永远在最下层
+                else:
+                    self.canvas.itemconfig(self.bg_image_id, image=self.tk_bg_image)
+
+                # 独立管理图标 (不修改底图像素)
+                if not hasattr(self, 'canvas_icons'):
+                    self.canvas_icons = {}
+
+                # 遍历所有标记，决定移动、显示还是隐藏
                 for m in self.marker_data:
-                    # 视锥剔除：如果点不在当前裁剪范围内，直接跳过（O(1)级判定）
+                    m_id = m['id']
+
+                    # 视锥剔除与距离计算
                     if x1 <= m['pixel_x'] <= x2 and y1 <= m['pixel_y'] <= y2:
-
-                        # 距离判定：靠近玩家 250 像素才显示
                         dist = ((m['pixel_x'] - center_x)**2 + (m['pixel_y'] - center_y)**2)**0.5
-                        if dist > 250: continue
 
-                        if self.auto_collect_var.get():
-                            if dist < config.PICKING_RADIUS and not m['is_collected']:
-                                m['is_collected'] = True
-                                need_save = True
-                                if DEBUG_MODE:
-                                    log_step(f"DEBUG: 自动采集资源点 {m['id']} (类型: {m['type']})")
+                        if dist > 250:
+                            # 距离过远，如果在画布上则隐藏
+                            if m_id in self.canvas_icons:
+                                self.canvas.itemconfig(self.canvas_icons[m_id], state="hidden")
+                            continue
 
-                        # 相对坐标换算
+                        # 自动采集逻辑
+                        if self.auto_collect_var.get() and dist < config.PICKING_RADIUS and not m['is_collected']:
+                            m['is_collected'] = True
+                            need_save = True
+                            if DEBUG_MODE:
+                                log_step(f"DEBUG: 自动采集资源点 {m['id']} (类型: {m['type']})")
+
+                        # 计算在 Canvas 上的相对坐标
                         rx, ry = int(m['pixel_x'] - x1), int(m['pixel_y'] - y1)
-                        # 从缓存获取图标
+
                         icon_set = self.icon_cache.get(m['type'])
-                        if icon_set:
-                            # 如果 is_collected 为 True，使用 prep_icons 生成的 gray 图像
-                            icon = icon_set["gray"] if m['is_collected'] else icon_set["normal"]
-                            pil_img.paste(icon, (rx - 12, ry - 12), icon)
+                        if not icon_set: continue
 
-                        # m_type_str = str(m['type'])
-                        # if m_type_str in self.icon_cache:
-                        #     state = "gray" if m['is_collected'] else "normal"
-                        #     icon = self.icon_cache[m_type_str][state]
-                        #     pil_img.paste(icon, (int(rx-12), int(ry-12)), icon)
+                        target_img = icon_set["tk_gray"] if m['is_collected'] else icon_set["tk_normal"]
 
-                # 3. 渲染到 Canvas
-                self.tk_image = ImageTk.PhotoImage(pil_img)
-                self.canvas.create_image(0, 0, anchor=tk.NW, image=self.tk_image)
+                        # 如果 Canvas 上还没这个图标，创建它
+                        if m_id not in self.canvas_icons:
+                            item_id = self.canvas.create_image(rx, ry, anchor=tk.CENTER, image=target_img)
+                            self.canvas_icons[m_id] = item_id
+                        else:
+                            # 如果已存在，仅更新位置、图片和状态（恢复显示）
+                            item_id = self.canvas_icons[m_id]
+                            self.canvas.coords(item_id, rx, ry)
+                            self.canvas.itemconfig(item_id, image=target_img, state="normal")
+                    else:
+                        # 视野外，如果有对应的 item 则隐藏
+                        if m_id in self.canvas_icons:
+                            self.canvas.itemconfig(self.canvas_icons[m_id], state="hidden")
 
                 # 绘制玩家位置圆圈
                 view_w = config.VIEW_SIZE
@@ -654,7 +749,12 @@ class MapTrackerApp:
                     # 将减半后的透明度合并回灰色图标
                     gray_img.putalpha(half_alpha)
 
-                    cache[m_type] = {"normal": img, "gray": gray_img}
+                    cache[m_type] = {
+                        "pil_normal": img,
+                        "pil_gray": gray_img,
+                        "tk_normal": ImageTk.PhotoImage(img),
+                        "tk_gray": ImageTk.PhotoImage(gray_img)
+                    }
                 except Exception as e:
                     log_step(f"图标 {fname} 加载失败: {e}")
         return cache
@@ -697,6 +797,9 @@ class MapTrackerApp:
             if not hasattr(self, 'orb_mini') or not hasattr(self, 'kp_big'):
                 time.sleep(0.5)
                 continue
+            if not hasattr(self, 'minimap_mask') or not hasattr(self, 'minimap_mask'):
+                time.sleep(0.5)
+                continue
             try:
                 # 1. 从队列获取最新帧 (如果队列为空，会在这里阻塞等待，不占 CPU)
                 # 设置 timeout 防止线程死锁无法退出
@@ -735,7 +838,11 @@ class MapTrackerApp:
                             continue
 
                     # --- 执行匹配 ---
-                    matches = self.bf.match(des_mini, current_des_big)
+                    if MATCHTYPE == "BF":
+                        matches = self.bf.match(des_mini, current_des_big)
+                    elif MATCHTYPE == "FLANN":
+                        matches = self.flann.match(des_mini, current_des_big)
+
                     good_matches = [m for m in matches if m.distance < 50]
                     good_matches = sorted(good_matches, key=lambda x: x.distance)[:80]
 
@@ -1082,6 +1189,10 @@ if __name__ == "__main__":
     import multiprocessing
     multiprocessing.freeze_support()
     log_step("程序启动")
+
+    if MATCHTYPE not in ["FLANN","BF"]:
+        MATCHTYPE = "BF"
+
     try:
         run_bootstrapper(force_selector=True)
     except Exception as e:

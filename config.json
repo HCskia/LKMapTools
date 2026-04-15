@@ -1,11 +1,12 @@
 {
-    "DEBUGMODE": false,
+    "DEBUGMODE": true,
     "MINIMAP": {
-        "top": 206,
-        "left": 2046,
+        "top": 84,
+        "left": 2347,
         "width": 160,
         "height": 160
     },
+    "MATCHTYPE": "FLANN",
     "WINDOW_GEOMETRY": "400x550+1500+100",
     "VIEW_SIZE": 400,
     "LOGIC_MAP_PATH": "assest/raw.png",
@@ -17,8 +18,8 @@
     "PICKING_RADIUS": 25,
     "ICON_PATH": "assest/icons",
     "FEATURES_PATH": "assest/ORB_features.npz",
-    "ORB_MINI_NFEATURES": 2500,
-    "ORB_MIN_MATCH_COUNT": 5,
+    "ORB_MINI_NFEATURES": 3000,
+    "ORB_MIN_MATCH_COUNT": 7,
     "ORB_NFEATURES": 300000,
     "ORB_SCALEFACTOR": 1.2,
     "ORB_NLEVELS": 8,

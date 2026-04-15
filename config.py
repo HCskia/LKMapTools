@@ -43,6 +43,7 @@ CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 DEFAULT_CONFIG = {
     "DEBUGMODE": False, # 调试模式
     "MINIMAP": {},
+    "MATCHTYPE":"BF",
     "WINDOW_GEOMETRY": "400x550+1500+100",
     "VIEW_SIZE": 400,
     "LOGIC_MAP_PATH": r"assest/raw.png",
@@ -105,6 +106,7 @@ settings = load_config()
 # 通用设置
 DEBUGMODE = settings["DEBUGMODE"]
 MINIMAP = settings.get("MINIMAP")
+MATCHTYPE = settings.get("MATCHTYPE")
 WINDOW_GEOMETRY = settings.get("WINDOW_GEOMETRY")
 VIEW_SIZE = settings.get("VIEW_SIZE")
 LOGIC_MAP_PATH = settings.get("LOGIC_MAP_PATH")
