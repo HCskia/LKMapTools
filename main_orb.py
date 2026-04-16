@@ -1125,60 +1125,55 @@ class MapTrackerApp:
                 kp_mini, des_mini = self.orb_mini.detectAndCompute(gray, self.minimap_mask)
 
                 # ... 这里完全保留上一回合为你优化的逻辑，不作任何删减 ...
-                if des_mini is not None and len(kp_mini) >= MIN_MATCH_COUNT:
-                    is_global_mode = (self.last_x is None) or (
-                                self.consecutive_failures >= self.global_search_threshold)
+                # ★ 优化：构建搜索计划列表，同时尝试局部和全局搜索
+                search_plans = []
+                is_global_mode = (self.last_x is None) or (
+                            self.consecutive_failures >= self.global_search_threshold)
 
-                    # --- 坐标系划分 ---
-                    if is_global_mode:
-                        if self.last_x is not None:
-                            log_step("定位丢失：重置参考坐标并开启全图扫描...")
-                            self.last_x = None
-                        current_des_big = self.des_big
-                        current_kp_big = self.kp_big
-                    else:
-                        # 局部搜索
-                        dist_sq = (self.pts_big_np[:, 0] - self.last_x) ** 2 + (
-                                    self.pts_big_np[:, 1] - self.last_y) ** 2
-                        search_radius = 800 + (self.consecutive_failures * 200)
-                        near_indices = np.where(dist_sq < search_radius ** 2)[0]
+                if not is_global_mode and self.last_x is not None:
+                    # 局部搜索
+                    dist_sq = (self.pts_big_np[:, 0] - self.last_x) ** 2 + (
+                                self.pts_big_np[:, 1] - self.last_y) ** 2
+                    search_radius = 800 + (self.consecutive_failures * 200)
+                    near_indices = np.where(dist_sq < search_radius ** 2)[0]
 
-                        if len(near_indices) > 20:
-                            current_des_big = self.des_big[near_indices]
-                            current_kp_big = [self.kp_big[i] for i in near_indices]
-                        else:
-                            self.consecutive_failures = self.global_search_threshold
-                            continue
+                    if len(near_indices) > 20:
+                        local_des = self.des_big[near_indices]
+                        local_kp = [self.kp_big[i] for i in near_indices]
+                        search_plans.append((local_des, local_kp, "local"))
 
+                # ★ 始终添加全局搜索作为备选
+                search_plans.append((self.des_big, self.kp_big, "global"))
+
+                # ★ 循环尝试所有搜索计划
+                found = False
+                raw_x, raw_y = None, None
+                search_type_used = None
+
+                for target_des, target_kp, search_type in search_plans:
+                    # 执行匹配
                     if MATCHTYPE == "BF":
-                        # k=2 表示返回最近的两个匹配点
-                        matches = self.bf.knnMatch(des_mini, current_des_big, k=2)
+                        matches = self.bf.knnMatch(des_mini, target_des, k=2)
                     elif MATCHTYPE == "FLANN":
-                        matches = self.flann.knnMatch(des_mini, current_des_big, k=2)
+                        matches = self.flann.knnMatch(des_mini, target_des, k=2)
 
                     good_matches = []
-                    # 使用配置中的比例，或者写死 0.75
                     ratio_thresh = getattr(config, 'ORB_RATIO', config.ORB_RATIO)
 
                     for match_pair in matches:
                         if len(match_pair) == 2:
                             m, n = match_pair
-                            # 核心比率测试：最优匹配的距离必须明显小于次优匹配
                             if m.distance < ratio_thresh * n.distance:
                                 good_matches.append(m)
                         elif len(match_pair) == 1:
                             good_matches.append(match_pair[0])
 
-                    # 取质量最高的前 100 个点即可，避免过多反而引入噪点
                     good_matches = sorted(good_matches, key=lambda x: x.distance)[:100]
 
                     if len(good_matches) >= config.ORB_MIN_MATCH_COUNT:
                         src_pts = np.float32([kp_mini[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-                        dst_pts = np.float32([current_kp_big[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+                        dst_pts = np.float32([target_kp[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
 
-                        #M, inliers = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC,ransacReprojThreshold=3.0) #部分仿射变换
-
-                        # 降低重投影误差阈值到 1.5，提高精度；增加迭代次数，保证能找到最优解
                         M, inliers = cv2.estimateAffinePartial2D(
                             src_pts, dst_pts,
                             method=cv2.RANSAC,
@@ -1187,46 +1182,42 @@ class MapTrackerApp:
                         )
 
                         if M is not None:
-                            s = np.sqrt(M[0, 0] ** 2 + M[0, 1] ** 2) #部分仿射变换
+                            s = np.sqrt(M[0, 0] ** 2 + M[0, 1] ** 2)
 
-                            # 游戏地图通常是 1:1，缩放应该极其接近 1.0
                             if 0.6 <= s <= 1.4:
-                                # dst = cv2.perspectiveTransform(self.mini_center_pt, M) # 单应性矩阵
-                                center_h = np.array([[[config.MINIMAP.get("width") / 2, config.MINIMAP.get("height")  / 2]]], dtype=np.float32)
+                                center_h = np.array([[[config.MINIMAP.get("width") / 2, config.MINIMAP.get("height") / 2]]], dtype=np.float32)
                                 dst = cv2.transform(center_h, M)
                                 raw_x, raw_y = int(dst[0][0][0]), int(dst[0][0][1])
 
-                                # 距离校验
-                                if self.last_x is not None:
-                                    if not is_global_mode:
-                                        dist = np.sqrt((raw_x - self.last_x) ** 2 + (raw_y - self.last_y) ** 2)
-                                        # 假设玩家 0.1 秒内不可能跑过 100 像素
-                                        if dist > 200:
-                                            self.consecutive_failures += 1
-                                            log_step("-》匹配结果跳变异常，放弃更新")
-                                            continue
+                                # ★ 关键区别：只有局部搜索才做距离校验
+                                if search_type == "local" and self.last_x is not None:
+                                    dist = np.sqrt((raw_x - self.last_x) ** 2 + (raw_y - self.last_y) ** 2)
+                                    if dist > 200:
+                                        # 局部结果太远，跳过这个结果，继续尝试全局
+                                        continue
 
-                                # 中位数滤波
-                                if (0 <= raw_x <= self.map_width) and (0 <= raw_y <= self.map_height):
-                                    # 将当前计算坐标加入队列
-                                    self.pos_history_x.append(raw_x)
-                                    self.pos_history_y.append(raw_y)
-
-                                    # 使用中位数滤波剔除离群噪点帧
-                                    median_x = int(np.median(self.pos_history_x))
-                                    median_y = int(np.median(self.pos_history_y))
-
-                                    self.last_x, self.last_y = median_x, median_y
-                                    self.current_pos = (median_x, median_y)  # 输出过滤后的稳态坐标
-                                    self.consecutive_failures = 0
-                                    self.found = True
-
-                            elif DEBUG_MODE:
-                                log_step("->匹配结果缩放异常，尝试计算其他锚点")
+                                # 找到有效结果
+                                found = True
+                                search_type_used = search_type
+                                break
                     else:
-                        self.consecutive_failures += 1
-                        self.found = False
+                        if search_type == "local":
+                            # 局部搜索匹配点不足，跳过并尝试全局
+                            continue
 
+                # ★ 统一处理结果
+                if found and raw_x is not None and (0 <= raw_x <= self.map_width) and (0 <= raw_y <= self.map_height):
+                    self.pos_history_x.append(raw_x)
+                    self.pos_history_y.append(raw_y)
+
+                    median_x = int(np.median(self.pos_history_x))
+                    median_y = int(np.median(self.pos_history_y))
+
+                    self.last_x, self.last_y = median_x, median_y
+                    self.current_pos = (median_x, median_y)
+                    if search_type_used == "global":
+                        self.consecutive_failures = 0
+                    self.found = True
                 else:
                     self.consecutive_failures += 1
                     self.found = False
