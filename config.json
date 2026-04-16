@@ -1,10 +1,10 @@
 {
     "DEBUGMODE": true,
     "MINIMAP": {
-        "top": 83,
-        "left": 2364,
-        "width": 160,
-        "height": 160
+        "top": 66,
+        "left": 2299,
+        "width": 214,
+        "height": 214
     },
     "MATCHTYPE": "FLANN",
     "VIEW_SIZE": 400,

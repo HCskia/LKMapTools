@@ -1,8 +1,24 @@
+# --- DPI 声明 -----------------------------------------------------
+import sys
+if sys.platform == "win32":
+    import ctypes
+    try:
+        # 强制接管物理像素 (Win10/Win11)
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(-4)
+    except Exception:
+        try:
+            # 退化方案 (Win8)
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            # 最终兜底 (Win7)
+            ctypes.windll.user32.SetProcessDPIAware()
+
+# ------------------------------------------------------------------
+
 import json
 import threading
 import queue
 import traceback
-
 import cv2
 import numpy as np
 import mss
@@ -16,7 +32,7 @@ import time
 import config  # <--- 导入同目录下的配置文件
 import subprocess
 import os
-import sys
+
 
 # Windows API 常量
 GWL_EXSTYLE = -20
@@ -1548,8 +1564,8 @@ class MinimapSelector(tk.Toplevel):
         """计算鼠标拖动的偏移量并移动窗口"""
         dx = event.x - self.start_x
         dy = event.y - self.start_y
-        self.x += dx
-        self.y += dy
+        self.x = self.winfo_x() + dx
+        self.y = self.winfo_y() + dy
         self.geometry(f"{self.size}x{self.size}+{self.x}+{self.y}")
 
     def on_scroll(self, event):
@@ -1565,35 +1581,94 @@ class MinimapSelector(tk.Toplevel):
         self.size += delta
         if self.size < 80:
             self.size = 80  # 限制最小不能低于 80 像素
-
         self.geometry(f"{self.size}x{self.size}+{self.x}+{self.y}")
         self.draw_ui()
 
     def save_and_exit(self, event=None):
-        """将当前坐标写入 config.json 并退出"""
+        """完全解决 Tkinter 句柄失效、0x0 报错以及 DPI 缩放问题的终极保存逻辑"""
+        import ctypes
+        from ctypes import wintypes
+
+        self.update_idletasks()
+
+        # 使用 wm_frame() 获取 Windows 认可的顶级窗口真正句柄
+        hwnd_str = self.wm_frame()
+        try:
+            # wm_frame() 返回的是十六进制字符串(如 '0x12345')，将其转换为 int 句柄
+            if hwnd_str.startswith('0x'):
+                hwnd = int(hwnd_str, 16)
+            else:
+                hwnd = int(hwnd_str)
+        except Exception:
+            hwnd = 0
+
+        rect = wintypes.RECT()
+        DWMWA_EXTENDED_FRAME_BOUNDS = 9
+        success = False
+
+        # 尝试通过 DWM 穿透获取视觉物理像素
+        if hwnd != 0:
+            try:
+                result = ctypes.windll.dwmapi.DwmGetWindowAttribute(
+                    ctypes.wintypes.HWND(hwnd),
+                    ctypes.wintypes.DWORD(DWMWA_EXTENDED_FRAME_BOUNDS),
+                    ctypes.byref(rect),
+                    ctypes.sizeof(rect)
+                )
+                # 返回值为 0 代表调用成功
+                if result == 0 and (rect.right - rect.left) > 0:
+                    real_left = rect.left
+                    real_top = rect.top
+                    real_width = rect.right - rect.left
+                    real_height = rect.bottom - rect.top
+                    success = True
+                    log_step("🎯 [方案 A] 成功通过 DWM 获取真实物理像素。")
+            except Exception as e:
+                log_step(f"方案 A 异常: {e}")
+
+        # 如果方案 A 失败或返回了 0，直接抓取 Windows 物理缩放比例进行硬计算
+        if not success:
+            log_step("⚠️ [方案 A] 失败，自动切换至 [方案 B] 物理缩放硬计算...")
+            try:
+                # 获取 Windows 的真实缩放 DPI (96 为 100%, 144 为 150%)
+                hdc = ctypes.windll.user32.GetDC(0)
+                dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)  # 88 代表 LOGPIXELSX
+                ctypes.windll.user32.ReleaseDC(0, hdc)
+                scale_factor = dpi / 96.0  # 算出缩放倍率，比如 1.25 或 1.5
+
+                # 直接通过 Tkinter 逻辑坐标 * 缩放倍率 = 真实物理像素
+                real_left = int(self.winfo_rootx() * scale_factor)
+                real_top = int(self.winfo_rooty() * scale_factor)
+                real_width = int(self.winfo_width() * scale_factor)
+                real_height = int(self.winfo_height() * scale_factor)
+            except Exception as e:
+                # 最终无解情况下的暴力兜底
+                log_step(f"方案 B 异常: {e}")
+                real_left = self.winfo_rootx()
+                real_top = self.winfo_rooty()
+                real_width = self.winfo_width()
+                real_height = self.winfo_height()
+
+        # 2. 写入配置文件
         config_data = {}
         if os.path.exists(CONFIG_FILE):
-            for try_count in range(1,4):
-                try:
-                    with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                        config_data = json.load(f)
-                except Exception as e:
-                    log_step(f"重试次数{try_count}次,写入config时发生错误：{e}")
-                    time.sleep(0.5)
+            try:
+                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                    config_data = json.load(f)
+            except Exception:
+                pass
 
-        # 更新 JSON 字典中的 MINIMAP 节点
         config_data["MINIMAP"] = {
-            "top": self.y,
-            "left": self.x,
-            "width": self.size,
-            "height": self.size
+            "top": real_top,
+            "left": real_left,
+            "width": real_width,
+            "height": real_height
         }
 
-        # 写回文件
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
             json.dump(config_data, f, indent=4, ensure_ascii=False)
 
-        log_step(f"✅ 小地图区域已成功保存: top={self.y}, left={self.x}, size={self.size}")
+        log_step(f"✅ 坐标锁定成功! 物理位置: ({real_left}, {real_top}) 大小: {real_width}x{real_height}")
         self.destroy()
 
 def log_step(step_name):
@@ -1644,16 +1719,6 @@ class ResourceDownload:
 if __name__ == "__main__":
     import multiprocessing
     multiprocessing.freeze_support()
-
-    # 解决 mss 和 Tkinter 坐标错位问题
-    import sys
-    if sys.platform == "win32":
-        try:
-            import ctypes
-
-            ctypes.windll.shcore.SetProcessDpiAwareness(1)
-        except Exception:
-            pass
 
     log_step("程序启动")
 
