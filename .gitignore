@@ -33,4 +33,6 @@ build/
 dist/
 
 # 忽略日志
+log.txt
+crash_log.txt
 *.txt
