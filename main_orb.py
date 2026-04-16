@@ -1124,7 +1124,6 @@ class MapTrackerApp:
                 # 2. 提取特征 (直接使用传入的 gray 和预计算好的 mask)
                 kp_mini, des_mini = self.orb_mini.detectAndCompute(gray, self.minimap_mask)
 
-                # ... 这里完全保留上一回合为你优化的逻辑，不作任何删减 ...
                 if des_mini is not None and len(kp_mini) >= MIN_MATCH_COUNT:
                     is_global_mode = (self.last_x is None) or (
                                 self.consecutive_failures >= self.global_search_threshold)
