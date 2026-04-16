@@ -24,7 +24,8 @@ MATCHTYPE = config.MATCHTYPE
 selector_event = threading.Event()
 WINDOW_GEOMETRY = "400x630+1500+100"
 resource_type_dicts = {
-    "采集资源":(701,737),
+    "矿物资源":(701,704),
+    "非矿物资源": (705,737),
     "宝箱":(301,322),
     "眠枭之星":(802,803)
 }
@@ -445,7 +446,7 @@ class MapTrackerApp:
 
         # 加载资源点位数据
         # --- 提取所有唯一的资源类型
-        self.resource_type_options = ["采集资源","宝箱","眠枭之星"]
+        self.resource_type_options = list(resource_type_dicts.keys())
         # 默认全选
         self.resource_type_selected_items = self.resource_type_options.copy()
         self.resource_type_button.config(text=f"过滤资源: 已选 {len(self.resource_type_options)} 类")
@@ -614,15 +615,17 @@ class MapTrackerApp:
                 radius_picking = radius + config.PICKING_RADIUS
                 bbox_picking = [center_x - radius_picking, center_y - radius_picking,
                         center_x + radius_picking, center_y + radius_picking]
+                # 清除渲染堆叠
+                self.canvas.delete("player_indicator")
 
                 # 采集范围圈
-                self.canvas.create_oval(bbox_picking, outline="yellow",dash=(4,2), width=1)
+                self.canvas.create_oval(bbox_picking, outline="yellow",dash=(4,2), width=1, tags="player_indicator")
                 if self.found:
                     # 定位成功：画红圈
-                    self.canvas.create_oval(bbox, outline="red", width=2)
+                    self.canvas.create_oval(bbox, outline="red", width=2, tags="player_indicator")
                 else:
                     # 定位丢失：画白圈
-                    self.canvas.create_oval(bbox, outline="white", width=2)
+                    self.canvas.create_oval(bbox, outline="white", width=2, tags="player_indicator")
         else:
             # 隐藏地图底图和所有图标
             if hasattr(self, 'bg_image_id') and self.bg_image_id:
@@ -631,15 +634,15 @@ class MapTrackerApp:
             # 隐藏所有动态图标 (利用 tags 批量操作)
             self.canvas.itemconfigure("all", state="hidden")
 
-            # 2. 显示或更新提示文字
-            display_text = "计算匹配定位锚点中..."
+            # 显示或更新提示文字
+            self.empty_display_text = "计算匹配定位锚点中..."
             center_pt = config.VIEW_SIZE // 2
 
             if not self.status_text_id:
                 # 第一次创建：白色文字，带一点点阴影效果（创建两个 text）
                 self.status_text_id = self.canvas.create_text(
                     center_pt, center_pt,
-                    text=display_text,
+                    text=self.empty_display_text,
                     fill="white",
                     font=("微软雅黑", 14, "bold"),
                     justify=tk.CENTER,
@@ -647,7 +650,7 @@ class MapTrackerApp:
                 )
 
             else:
-                self.canvas.itemconfig(self.status_text_id, state="normal", text=display_text)
+                self.canvas.itemconfig(self.status_text_id, state="normal", text=self.empty_display_text)
                 self.canvas.tag_raise(self.status_text_id)
 
         if need_save and int(time.time() * 10) % 10 == 0:
@@ -790,44 +793,6 @@ class MapTrackerApp:
                 "collected_ids": collected_ids,
                 "custom_markers": custom_markers
             }, f, ensure_ascii=False, indent=4)
-
-    # def load_markers(self, json_path):
-    #     """加载资源点并转换坐标"""
-    #     # --- 这里的参数必须和拼接大图时的参数完全一致 ---
-    #     X_MIN = -12
-    #     Y_MIN = -11
-    #     TILE_SIZE = 256
-    #     SCALE = 1
-    #     # --------------------------------------------
-    #     collected_ids = self.load_picking_data(config.PICKINGDATA_PATH)  # 获取已采集列表
-    #     processed_markers = []
-    #     try:
-    #         with open(json_path, 'r', encoding='utf-8') as f:
-    #             data = json.load(f)
-    #             # 假设 JSON 结构是包含 'points' 列表的
-    #             points = data if isinstance(data, list) else data.get('points', [])
-    #
-    #             for item in points:
-    #                 lat = item['point']['lat']
-    #                 lng = item['point']['lng']
-    #                 m_id = item.get('id')
-    #
-    #                 # 核心换算公式
-    #                 px = int((lng / TILE_SIZE - X_MIN) * TILE_SIZE * SCALE)
-    #                 py = int((lat / TILE_SIZE - Y_MIN) * TILE_SIZE * SCALE)
-    #
-    #                 processed_markers.append({
-    #                     'id': m_id,
-    #                     'type': str(item.get('markType')),  # 转为字符串方便匹配文件名
-    #                     'pixel_x': px,
-    #                     'pixel_y': py,
-    #                     'is_collected': m_id in collected_ids  # 初始状态
-    #                 })
-    #         log_step(f"成功加载 {len(processed_markers)} 个资源点")
-    #     except Exception as e:
-    #         log_step(f"加载点位失败: {e}")
-    #
-    #     return processed_markers
 
     def load_markers(self, json_path):
         """加载资源点并转换坐标"""
