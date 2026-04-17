@@ -1,0 +1,33 @@
+{
+    "DEBUGMODE": true,
+    "MINIMAP": {},
+    "MATCHTYPE": "FLANN",
+    "VIEW_SIZE": 400,
+    "LOGIC_MAP_PATH": "assest/raw.png",
+    "DISPLAY_MAP_PATH": "assest/raw.png",
+    "MAX_LOST_FRAMES": 50,
+    "MAX_KP_PER_LAYER": 100000,
+    "POINTS_PATH": "assest/points.json",
+    "PICKINGDATA_PATH": "assest/picking_data.json",
+    "PICKING_RADIUS": 30,
+    "ICON_PATH": "assest/icons",
+    "FEATURES_PATH": "assest/ORB_features.npz",
+    "ORB_MINI_NFEATURES": 3000,
+    "ORB_MIN_MATCH_COUNT": 7,
+    "ORB_NFEATURES": 300000,
+    "ORB_SCALEFACTOR": 1.2,
+    "ORB_NLEVELS": 8,
+    "ORB_FASTTHRESHOLD": 5,
+    "ORB_EDGETHRESHOLD": 25,
+    "ORB_MAP_PATH": "assest/raw.png",
+    "ORB_MAP_NOEDGE_PATH": "assest/raw_noedge.png",
+    "ORB_CLIPLIMIT": 2.0,
+    "ORB_RATIO": 0.75,
+    "ORB_RANSAC_THRESHOLD": 5.0,
+    "ORB_REFRESH_RATE": 20,
+    "ORB_CLAHE_LIMIT": 3.0,
+    "ORB_GRID": [
+        120,
+        120
+    ]
+}
