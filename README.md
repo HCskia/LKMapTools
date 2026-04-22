@@ -30,7 +30,7 @@
 
 ### 1. 环境依赖
 ```bash
-pip install opencv-python numpy mss pillow
+pip install opencv-python-headless numpy mss pillow pynput
 ```
 
 ### 2.项目结构

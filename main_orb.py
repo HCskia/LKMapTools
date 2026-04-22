@@ -25,12 +25,10 @@ import mss
 import ctypes
 from pynput import keyboard
 import tkinter as tk
-from tkinter import ttk
 from tkinter import messagebox
-from PIL import Image, ImageTk, ImageDraw
+from PIL import Image, ImageTk
 import time
 import config  # <--- 导入同目录下的配置文件
-import subprocess
 import os
 
 
@@ -758,7 +756,6 @@ class MapTrackerApp:
             if self.is_dragging:
                 # 正在拖动时，只维持 100ms 一次的低频检查，或者直接 return
                 self.root.after(100, self.update_tracker)
-                return
             else:
                 self.root.after(config.ORB_REFRESH_RATE, self.update_tracker)
 
