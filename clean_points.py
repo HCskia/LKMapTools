@@ -2,11 +2,30 @@ import re
 import json
 from html import unescape
 
+import requests
 
-def extract_map_points_v2(input_file, output_file):
-    with open(input_file, 'r', encoding='utf-8') as f:
-        content = f.read()
+wiki_url = "https://wiki.biligame.com/rocom/Data:Mapnew/point.json"
 
+def fetch_json_as_string(url):
+    """
+    从给定的 URL 获取 JSON 内容，并以字符串形式返回。
+    如果请求失败或响应内容不是有效的 JSON 字符串，则会引发异常。
+    """
+    try:
+        # 发送 GET 请求
+        response = requests.get(url)
+        # 检查请求是否成功（状态码 200）
+        response.raise_for_status()
+
+        # 获取响应文本（即 JSON 字符串）
+        json_str = response.text
+        return json_str
+    except requests.exceptions.RequestException as e:
+        print(f"请求失败: {e}")
+        raise
+
+def extract_map_points_v2(json_str, output_file):
+    content = json_str
     # 1. 定位 mapPointData 区域
     pattern = re.compile(r'<div[^>]*id="mapPointData"[^>]*>(.*?)</div>', re.DOTALL)
     match = pattern.search(content)
@@ -51,4 +70,4 @@ def extract_map_points_v2(input_file, output_file):
 
 
 # 执行
-extract_map_points_v2('point.json', 'point_cleaned.json')
+extract_map_points_v2(fetch_json_as_string(wiki_url), 'points.json')

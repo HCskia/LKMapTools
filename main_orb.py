@@ -1,5 +1,8 @@
 # --- DPI 声明 -----------------------------------------------------
+import glob
 import sys
+import uuid
+
 if sys.platform == "win32":
     import ctypes
     try:
@@ -25,12 +28,11 @@ import mss
 import ctypes
 from pynput import keyboard
 import tkinter as tk
-from tkinter import ttk
+import customtkinter as ctk
 from tkinter import messagebox
-from PIL import Image, ImageTk, ImageDraw
+from PIL import Image, ImageTk
 import time
 import config  # <--- 导入同目录下的配置文件
-import subprocess
 import os
 
 
@@ -38,6 +40,10 @@ import os
 GWL_EXSTYLE = -20
 WS_EX_LAYERED = 0x00080000
 WS_EX_TRANSPARENT = 0x00000020
+
+# UI主题设置
+ctk.set_appearance_mode("System")
+ctk.set_default_color_theme("blue")
 
 # 参数
 DEBUG_MODE = config.DEBUGMODE
@@ -54,6 +60,27 @@ resource_type_dicts = {
     "魔力果实":(807,809)
 }
 MINIMAP_DATA = {}
+group_text = "交流群：984599317"
+
+# 自定义部分路径常量
+CUSTOM_POINTS_DIR = "assest/custom/points"
+CUSTOM_ROUTES_DIR = "assest/custom/routes"
+ICON_DIR = "assest/icons"
+
+os.makedirs(CUSTOM_POINTS_DIR, exist_ok=True)
+os.makedirs(CUSTOM_ROUTES_DIR, exist_ok=True)
+os.makedirs(ICON_DIR, exist_ok=True)
+
+# 性能参数
+SETTING_VAR = "HIGH"
+TOOL_SETTINGS = {
+    "HIGH":{
+        "maxIters":2000
+    },
+    "LOW":{
+        "maxIters":800
+    }
+}
 
 def super_enhance(image, isPlayer=False): #return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     # 转为灰度
@@ -64,57 +91,128 @@ def super_enhance(image, isPlayer=False): #return cv2.cvtColor(image, cv2.COLOR_
     enhanced = cv2.convertScaleAbs(gray, alpha=alpha, beta=beta)
     return enhanced
 
+def generate_marker_id():
+    return uuid.uuid4().hex[:20]
 
-class BigMapWindow(tk.Toplevel):
-    def __init__(self, master, map_img, markers, icon_cache, resource_type_selected_items):
+class BigMapWindow(ctk.CTkToplevel):
+    def __init__(
+            self,
+            master,
+            map_img,
+            system_markers,
+            custom_markers,
+            icon_cache,
+            resource_type_selected_items,
+            parent_app=None
+    ):
         super().__init__(master)
         self.title("全图预览 - 鼠标滚轮缩放 / 左键拖拽")
-        self.geometry("1000x800")
+        self.geometry("1100x800")
 
-        self.original_img = map_img.convert("RGBA")  # PIL Image 对象
-        self.markers = markers
+        self.parent_app = parent_app
+        self.original_img = map_img.convert("RGBA")
+        self.markers = system_markers
+        self.custom_markers = custom_markers
         self.icon_cache = icon_cache
-
-        # 烘焙原尺寸大图 (包含图标)
         self.resource_type_selected_items = resource_type_selected_items
-        self.baked_full_image = self.bake_static_map()
-        self.orig_w, self.orig_h = self.baked_full_image.size
 
-        # 生成缩略图缓存 (用于极度缩小的情况，提升画质和性能)
-        # 设定缩略图最大边长为 2048
+        # --- UI 追踪字典
+        self.custom_canvas_icons = {}
+
+        # --- 核心：烘焙两套大图（一套带系统点，一套纯净版） ---
+        self.pure_map_img = self.original_img.copy()  # 纯净版地图
+        self.baked_system_img = self.bake_static_map()  # 包含系统标点的地图
+        self.orig_w, self.orig_h = self.baked_system_img.size
+
+        # 预生成两套缩略图提升性能
         thumb_ratio = min(2048 / self.orig_w, 2048 / self.orig_h)
         if thumb_ratio < 1.0:
-            self.thumbnail_img = self.baked_full_image.resize(
-                (int(self.orig_w * thumb_ratio), int(self.orig_h * thumb_ratio)),
-                Image.Resampling.BILINEAR
-            )
+            self.system_thumbnail_img = self.baked_system_img.resize(
+                (int(self.orig_w * thumb_ratio), int(self.orig_h * thumb_ratio)), Image.Resampling.BILINEAR)
+            self.pure_thumbnail_img = self.pure_map_img.resize(
+                (int(self.orig_w * thumb_ratio), int(self.orig_h * thumb_ratio)), Image.Resampling.BILINEAR)
             self.thumb_scale_factor = thumb_ratio
         else:
-            self.thumbnail_img = self.baked_full_image
+            self.system_thumbnail_img = self.baked_system_img
+            self.pure_thumbnail_img = self.pure_map_img
             self.thumb_scale_factor = 1.0
 
-        self.is_dragging = False  # 初始化拖拽状态
-        self.scale = 0.2  # 初始缩放比例（全图通常很大，默认缩小显示）
-        self.offset_x = 0
-        self.offset_y = 0
+        # 初始状态设为显示系统标点
+        self.baked_full_image = self.baked_system_img
+        self.thumbnail_img = self.system_thumbnail_img
+        self.is_dragging = False
+        self.scale = 0.2
 
-        # 将视角居中
-        self.offset_x = (self.winfo_width() - self.orig_w * self.scale) / 2
-        self.offset_y = (self.winfo_height() - self.orig_h * self.scale) / 2
+        if self.parent_app and self.parent_app.smooth_x is not None:
+            self.offset_x = (self.winfo_width() / 2) - self.parent_app.smooth_x * self.scale
+            self.offset_y = (self.winfo_height() / 2) - self.parent_app.smooth_y * self.scale
+        else:
+            self.offset_x = (1000 - self.orig_w * self.scale) / 2
+            self.offset_y = (800 - self.orig_h * self.scale) / 2
+
+        # === 顶部 UI 区域
+        self.top_frame = ctk.CTkFrame(self, height=40, corner_radius=0, fg_color="#2b2b2b")
+        self.top_frame.pack(side=tk.TOP, fill=tk.X)
+
+        self.btn_save_points = ctk.CTkButton(self.top_frame, text="保存标点", width=80, command=self.save_custom_points)
+        self.btn_save_points.pack(side=tk.LEFT, padx=5, pady=5)
+
+        self.btn_save_route = ctk.CTkButton(self.top_frame, text="保存连线", width=80, command=self.save_custom_route)
+        self.btn_save_route.pack(side=tk.LEFT, padx=5, pady=5)
+
+        # 仅看自定义标点勾选框
+        self.show_only_custom_var = ctk.BooleanVar(value=False)
+        self.chk_only_custom = ctk.CTkCheckBox(self.top_frame, text="仅看自定义", variable=self.show_only_custom_var,
+                                               command=self.on_show_custom_toggle)
+        self.chk_only_custom.pack(side=tk.LEFT, padx=15, pady=5)
+
+        # 查看路线下拉框
+        route_files = glob.glob(os.path.join(CUSTOM_ROUTES_DIR, "*.json"))
+        route_names = ["不显示路线"] + [os.path.basename(r) for r in route_files]
+        self.view_route_var = tk.StringVar(value="不显示路线")
+        self.cmb_view_route = ctk.CTkComboBox(self.top_frame, values=route_names, variable=self.view_route_var,
+                                              command=self.on_view_route_change)
+        self.cmb_view_route.pack(side=tk.LEFT, padx=5, pady=5)
 
         self.canvas = tk.Canvas(self, bg='#1a1a1a', cursor="fleur")
-        self.canvas.pack(fill=tk.BOTH, expand=True)
+        self.canvas.pack(fill=ctk.BOTH, expand=True)
 
-        # 绑定事件
+        self.is_route_mode = False
+        self.current_route_nodes = []
+        self.temp_route_lines = []
+
         self.canvas.bind("<MouseWheel>", self.on_zoom)
         self.canvas.bind("<ButtonPress-1>", self.on_drag_start)
         self.canvas.bind("<B1-Motion>", self.on_drag_move)
         self.canvas.bind("<ButtonRelease-1>", self.on_drag_release)
-
-        # 窗口大小改变时重新渲染
+        self.canvas.bind("<Button-3>", self.on_right_click)
+        self.bind("<r>", self.toggle_route_mode)
+        self.bind("<R>", self.toggle_route_mode)
+        self.canvas.bind("<Button-1>", self.on_left_click, add="+")
         self.bind("<Configure>", lambda e: self.render())
 
-        self.after(300, self.render) # 绘制刷新时间
+        self.after(300, self.render)
+
+    def on_show_custom_toggle(self):
+        """切换底图版本：是否隐藏系统标点"""
+        if self.show_only_custom_var.get():
+            self.baked_full_image = self.pure_map_img
+            self.thumbnail_img = self.pure_thumbnail_img
+        else:
+            self.baked_full_image = self.baked_system_img
+            self.thumbnail_img = self.system_thumbnail_img
+        self.render()
+
+    def on_view_route_change(self, choice):
+        """选择加载对应的路线文件进行预览"""
+        if choice == "不显示路线":
+            self.viewing_route_data = None
+        else:
+            filepath = os.path.join(CUSTOM_ROUTES_DIR, choice)
+            if os.path.exists(filepath):
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    self.viewing_route_data = json.load(f)
+        self.update_dynamic_ui()
 
     def bake_static_map(self):
         """将所有图标预先绘制到大图上，生成一个静态图层"""
@@ -222,6 +320,8 @@ class BigMapWindow(tk.Toplevel):
         self.tk_img = ImageTk.PhotoImage(display_img)
         self.canvas.delete("map_img")
         self.canvas.create_image(draw_x, draw_y, anchor=tk.NW, image=self.tk_img, tags="map_img")
+        self.canvas.tag_lower("map_img")  # 核心：底图必须最底下
+        self.update_dynamic_ui()  # 核心：重新计算所有动态标点
 
     def on_zoom(self, event):
         """以鼠标位置为中心的缩放算法"""
@@ -264,11 +364,328 @@ class BigMapWindow(tk.Toplevel):
         # 只有在鼠标松开时，才进行一次完整的 render 计算坐标对齐
         self.render()
 
+    def get_canvas_coords(self, phys_x, phys_y):
+        """将原图的绝对物理坐标转换为当前 UI 画布的相对坐标"""
+        canvas_x = phys_x * self.scale + self.offset_x
+        canvas_y = phys_y * self.scale + self.offset_y
+        return canvas_x, canvas_y
+
+    def get_physical_coords(self, canvas_x, canvas_y):
+        """将用户点击的画布坐标还原为游戏物理坐标"""
+        phys_x = (canvas_x - self.offset_x) / self.scale
+        phys_y = (canvas_y - self.offset_y) / self.scale
+        return phys_x, phys_y
+
+    def get_marker_by_id(self, marker_id):
+        """通过 ID 查找标点（同时遍历基础点位和新增自定义点位）"""
+        for m in self.markers + self.custom_markers:
+            if m['id'] == marker_id:
+                return m
+        return None
+
+    def clear_route_highlight(self):
+        """清理连线模式的临时高亮圈和黄线"""
+        for node in self.current_route_nodes:
+            if 'highlight_id' in node:
+                self.canvas.delete(node['highlight_id'])
+        for line_id in self.temp_route_lines:
+            self.canvas.delete(line_id)
+
+        self.current_route_nodes = []
+        self.temp_route_lines = []
+
+    def render_single_marker(self, marker):
+        """在画布上动态渲染单个自定义标点（无需重新烘焙整张地图）"""
+        m_type = str(marker['markType'])
+        icon_set = self.icon_cache.get(m_type)
+        if icon_set:
+            cx, cy = self.get_canvas_coords(marker['pixel_x'], marker['pixel_y'])
+            # 创建 Canvas 图像，并记录 ID 用于后续移动或删除
+            marker['canvas_id'] = self.canvas.create_image(
+                cx, cy, anchor=tk.CENTER, image=icon_set["tk_normal"], tags="custom_marker"
+            )
+            self.canvas.tag_raise(marker['canvas_id'])
+
+    def update_marker_icon(self, marker, new_icon_name, window):
+        """更新单个标点的图标 (覆盖你原本留空的这个方法)"""
+        marker['markType'] = new_icon_name
+        icon_set = self.icon_cache.get(str(new_icon_name))
+        if icon_set and 'canvas_id' in marker:
+            self.canvas.itemconfig(marker['canvas_id'], image=icon_set["tk_normal"])
+        window.destroy()
+
+    def update_dynamic_ui(self):
+        """所有非烘焙元素的实时对齐与重绘 (彻底告别幽灵标点)"""
+        if not hasattr(self, 'custom_canvas_icons'):
+            self.custom_canvas_icons = {}
+
+        # 自动对齐自定义标点
+        for m in self.custom_markers:
+            cx, cy = self.get_canvas_coords(m['pixel_x'], m['pixel_y'])
+            icon_set = self.icon_cache.get(str(m.get('type', '301')))
+            m_id = m['id']
+
+            if m_id not in self.custom_canvas_icons:
+                if icon_set:
+                    item_id = self.canvas.create_image(cx, cy, anchor=tk.CENTER, image=icon_set["tk_normal"],
+                                                       tags="custom_marker")
+                    self.custom_canvas_icons[m_id] = item_id
+            else:
+                item_id = self.custom_canvas_icons[m_id]
+                self.canvas.coords(item_id, cx, cy)
+                if icon_set:
+                    self.canvas.itemconfig(item_id, image=icon_set["tk_normal"])
+                self.canvas.tag_raise(item_id)
+
+        # 路线节点与虚线逻辑
+        for node in self.current_route_nodes:
+            if 'highlight_id' in node:
+                m = self.get_marker_by_id(node['id'])
+                if m:
+                    cx, cy = self.get_canvas_coords(m['pixel_x'], m['pixel_y'])
+                    self.canvas.coords(node['highlight_id'], cx - 10, cy - 10, cx + 10, cy + 10)
+                    self.canvas.tag_raise(node['highlight_id'])
+
+        if len(self.current_route_nodes) > 1 and len(self.temp_route_lines) == len(self.current_route_nodes) - 1:
+            for i in range(len(self.temp_route_lines)):
+                m1 = self.get_marker_by_id(self.current_route_nodes[i]['id'])
+                m2 = self.get_marker_by_id(self.current_route_nodes[i + 1]['id'])
+                if m1 and m2:
+                    x1, y1 = self.get_canvas_coords(m1['pixel_x'], m1['pixel_y'])
+                    x2, y2 = self.get_canvas_coords(m2['pixel_x'], m2['pixel_y'])
+                    self.canvas.coords(self.temp_route_lines[i], x1, y1, x2, y2)
+                    self.canvas.tag_raise(self.temp_route_lines[i])
+
+        # 绘制预览的路线
+        self.canvas.delete("view_route_line")
+        if getattr(self, 'viewing_route_data', None):
+            valid_nodes = []
+            for node in self.viewing_route_data.get('nodes', []):
+                m = self.get_marker_by_id(node['id'])
+                if m: valid_nodes.append(m)
+
+            for i in range(len(valid_nodes) - 1):
+                m1, m2 = valid_nodes[i], valid_nodes[i + 1]
+                x1, y1 = self.get_canvas_coords(m1['pixel_x'], m1['pixel_y'])
+                x2, y2 = self.get_canvas_coords(m2['pixel_x'], m2['pixel_y'])
+                self.canvas.create_line(x1, y1, x2, y2, fill="#FF00FF", width=3, dash=(4, 2), arrow=tk.LAST,
+                                        tags="view_route_line")
+
+        self.canvas.tag_raise("custom_marker")
+
+    def on_right_click(self, event):
+        if self.is_route_mode: return
+
+        clicked_marker = None
+        is_custom = False
+
+        # 开启了"仅看自定义"，就不遍历系统标点
+        all_markers = self.custom_markers if self.show_only_custom_var.get() else self.markers + self.custom_markers
+
+        for m in all_markers:
+            cx, cy = self.get_canvas_coords(m['pixel_x'], m['pixel_y'])
+            if (cx - event.x) ** 2 + (cy - event.y) ** 2 < 225:
+                clicked_marker = m
+                is_custom = m.get('is_custom', False)
+                break
+
+        # 创建右键菜单
+        menu = tk.Menu(self, tearoff=0)
+
+        if clicked_marker:
+            if is_custom:
+                menu.add_command(label="编辑标点", command=lambda: self.edit_marker(clicked_marker))
+                menu.add_command(label="删除标点", command=lambda: self.delete_marker(clicked_marker))
+            else:
+                # 点击了系统自带标点，仅提示
+                menu.add_command(label="系统标点无法修改", state="disabled")
+        else:
+            # 点击了空地
+            menu.add_command(label="创建标点", command=lambda: self.create_marker(event.x, event.y))
+
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def create_marker(self, canvas_x, canvas_y):
+        phys_x, phys_y = self.get_physical_coords(canvas_x, canvas_y)
+        new_marker = {
+            "id": generate_marker_id(),
+            "type": "301",
+            "markType": "301",
+            "pixel_x": phys_x,
+            "pixel_y": phys_y,
+            "is_custom": True,
+            "is_collected": False
+        }
+        # 将新点位通知给主程序，主程序和此窗口共享该数据！
+        if self.parent_app:
+            self.parent_app.on_custom_marker_added(new_marker)
+        else:
+            self.custom_markers.append(new_marker)
+
+        self.update_dynamic_ui()  # 立刻刷新
+
+    def delete_marker(self, marker):
+        if self.parent_app:
+            self.parent_app.on_custom_marker_deleted(marker)
+        else:
+            self.custom_markers.remove(marker)
+
+        m_id = marker['id']
+        if hasattr(self, 'custom_canvas_icons') and m_id in self.custom_canvas_icons:
+            self.canvas.delete(self.custom_canvas_icons[m_id])
+            del self.custom_canvas_icons[m_id]
+
+    def edit_marker(self, marker):
+        """弹出带滚动条的可视化图标选择窗口"""
+        top = ctk.CTkToplevel(self)
+        top.title("选择图标")
+        top.geometry("500x500")
+        top.attributes("-topmost", True)  # 确保窗口不被大地图遮挡
+
+        # 创建自带滚动条的框架
+        scroll_frame = ctk.CTkScrollableFrame(top)
+        scroll_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        row, col = 0, 0
+
+        # 遍历程序启动时已经加载好的 icon_cache
+        for icon_name, icon_data in self.icon_cache.items():
+            # 使用标准 tk.Button 因为它与 ImageTk.PhotoImage 兼容性完美
+            # 背景色设为深色以契合夜间模式
+            btn = tk.Button(
+                scroll_frame,
+                image=icon_data["tk_normal"],
+                relief=tk.FLAT,
+                bg="#3b3b3b",
+                activebackground="#5a5a5a",
+                cursor="hand2",
+                command=lambda n=icon_name: self.update_marker_icon(marker, n, top)
+            )
+            btn.grid(row=row, column=col, padx=8, pady=8)
+
+            col += 1
+            if col > 7:  # 每排显示 8 个图标
+                col = 0
+                row += 1
+
+    def update_marker_icon(self, marker, new_icon_name, window):
+        marker['type'] = str(new_icon_name)      # 同步主程序标识
+        marker['markType'] = str(new_icon_name)  # 同步本地标识
+        self.update_dynamic_ui()                 # 立刻刷新图标
+        window.destroy()
+
+    def save_custom_points(self):
+        """修复保存逻辑：遍历整个共享池"""
+        if not self.custom_markers:
+            messagebox.showinfo("提示", "当前没有任何自定义标点")
+            return
+
+        export_data = {}
+        for m in self.custom_markers:
+            m_type = str(m.get('type', m.get('markType', '301')))
+            if m_type not in export_data:
+                export_data[m_type] = []
+
+            export_data[m_type].append({
+                "markType": m_type,
+                "id": m['id'],
+                "point": {
+                    "lat": m['pixel_y'],
+                    "lng": m['pixel_x']
+                }
+            })
+
+        filepath = os.path.join(CUSTOM_POINTS_DIR, "user_points.json")
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(export_data, f, ensure_ascii=False, indent=2)
+        messagebox.showinfo("成功", f"标点已保存至 {filepath}")
+
+    def toggle_route_mode(self, event=None):
+        self.is_route_mode = not self.is_route_mode
+        if self.is_route_mode:
+            messagebox.showinfo("模式切换", "目前是路径定义模式，请左键点击标点进行连线。")
+        else:
+            # 退出模式，清理临时高亮状态，但不清理数据
+            self.clear_route_highlight()
+            messagebox.showinfo("模式切换", "已退出路径定义模式。")
+
+    def on_left_click(self, event):
+        if not self.is_route_mode:
+            return  # 仅在路径模式下拦截左键
+
+        # 查找被点击的标点
+        all_markers = self.markers + self.custom_markers
+        clicked_marker = None
+        for m in all_markers:
+            cx, cy = self.get_canvas_coords(m['pixel_x'], m['pixel_y'])
+            if (cx - event.x) ** 2 + (cy - event.y) ** 2 < 225:
+                clicked_marker = m
+                break
+
+        if not clicked_marker:
+            return
+
+        # 检查是否已经被连过线
+        if any(node['id'] == clicked_marker['id'] for node in self.current_route_nodes):
+            return  # 已存在则忽略
+
+        # 1. 变绿高亮 (假设图标有外框，或者直接在图标下面画一个绿圈)
+        cx, cy = self.get_canvas_coords(clicked_marker['pixel_x'], clicked_marker['pixel_y'])
+        hl_id = self.canvas.create_oval(cx - 10, cy - 10, cx + 10, cy + 10, outline="green", width=3)
+
+        # 2. 如果不是第一个点，连上黄色的线
+        if len(self.current_route_nodes) > 0:
+            prev_node = self.current_route_nodes[-1]
+            prev_m = self.get_marker_by_id(prev_node['id'])
+            px, py = self.get_canvas_coords(prev_m['pixel_x'], prev_m['pixel_y'])
+
+            line_id = self.canvas.create_line(px, py, cx, cy, fill="yellow", width=2, dash=(4, 2))
+            self.temp_route_lines.append(line_id)
+
+        # 3. 加入路线列表
+        self.current_route_nodes.append({
+            "id": clicked_marker['id'],
+            "is_custom": clicked_marker.get('is_custom', False),
+            "highlight_id": hl_id
+        })
+
+    def save_custom_route(self):
+        if len(self.current_route_nodes) < 2:
+            messagebox.showwarning("警告", "路线至少需要包含2个标点！")
+            return
+
+        # 要求极强的拓展性和易维护性，采用带有元数据的 JSON 结构
+        route_data = {
+            "version": "1.0",
+            "route_name": f"route_{generate_marker_id()[:6]}",
+            "node_count": len(self.current_route_nodes),
+            "nodes": [
+                {
+                    "order": idx,
+                    "id": node['id'],
+                    "is_custom": node['is_custom']
+                } for idx, node in enumerate(self.current_route_nodes)
+            ]
+        }
+
+        filepath = os.path.join(CUSTOM_ROUTES_DIR, f"{route_data['route_name']}.json")
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(route_data, f, ensure_ascii=False, indent=2)
+
+        messagebox.showinfo("成功", f"路线已保存至 {filepath}")
+        self.clear_route_highlight()  # 保存后清理
+        self.current_route_nodes = []
+        if self.parent_app:
+            self.parent_app.refresh_route_list()
+
+
+
 class MapTrackerApp:
     def __init__(self, root):
         log_step("正在尝试建立主root")
         self.root = root
-        self.root.title("ORB算法小地图定位工具")
+
+        self.root.title(f"{group_text}")
         self.status_text_id = None
 
         # --- 窗口属性设置 ---
@@ -281,92 +698,89 @@ class MapTrackerApp:
 
         # --- UI初始化 ---
         log_step("正在初始化UI")
-        self.status_label = tk.Label(root, text="软件加载，请稍候...", fg="white", bg="black")
-        self.status_label.pack()
+        self.status_label = ctk.CTkLabel(
+            root,
+            text="软件加载，请稍候...",
+            font=("微软雅黑", 12))
+        self.status_label.pack(side=ctk.TOP, fill=ctk.X, pady=5)
         self.root.after(100, self.ui_delayed_init)
 
         # UI 组件
         # --- 使用配置文件中的悬浮窗视野大小 (VIEW_SIZE)
         log_step("尝试加载UI组件")
-        self.canvas = tk.Canvas(root, width=config.VIEW_SIZE, height=config.VIEW_SIZE, bg='#2b2b2b')
-        self.canvas.pack(fill=tk.BOTH, expand=True)
+        self.canvas_container = ctk.CTkFrame(root, fg_color="transparent")
+        self.canvas_container.pack(fill="both", expand=True, padx=5, pady=5)
+
+        self.canvas = tk.Canvas(
+            self.canvas_container,
+            bg='#EBEBEB',
+            highlightthickness=0,
+            borderwidth=0,
+            cursor="cross"
+        )
+        #self.canvas.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self.canvas.pack(fill="both", expand=True)
+
+
         self.image_on_canvas = None
 
         print(MINIMAP_DATA)
 
+        # UI底部控制区
+        self.ctrl_frame = ctk.CTkFrame(self.root, fg_color="transparent")
+        self.ctrl_frame.pack(
+            side=ctk.BOTTOM,
+            fill=ctk.X,
+            padx=5,
+            pady=5
+        )
+        # 隐藏 UI 面板的状态和按钮
+        self.ui_hidden = False
+
+        # 这个小按钮放在最外层，用于面板被隐藏后让用户可以重新点出来
+        self.btn_show_ctrl = ctk.CTkButton(self.root, text="▼ 展开控制面板 (Alt+I)", height=24, command=self.toggle_ctrl_frame)
+
+        # 在控制面板内部放一个隐藏按钮
+        self.btn_hide_ctrl = ctk.CTkButton(self.ctrl_frame, text="▲ 隐藏面板 (Alt+I)", fg_color="#555555", hover_color="#333333", command=self.toggle_ctrl_frame)
+        self.btn_hide_ctrl.pack(side=ctk.BOTTOM, fill=ctk.X, pady=(10, 0))
+
         # UI锁定-用于全屏
         # -- 开启UI锁定
-        self.ui_lock_var = tk.BooleanVar(value=False)
-        self.ui_lock_cb = tk.Checkbutton(
-            root,
-            text="开启UI锁定【快捷键:alt+L】*需要管理员运行程序",
+        self.ui_lock_var = ctk.BooleanVar(value=False)
+        self.ui_lock_cb = ctk.CTkCheckBox(
+            self.ctrl_frame,
+            text="开启UI锁定 (Alt+L) *需要管理员模式运行",
             variable=self.ui_lock_var,
-            bg='#2b2b2b',
-            fg='white',
-            selectcolor='#3c3f41',
-            activebackground='#2b2b2b',
-            activeforeground='white',
             command = self.toggle_ui_lock_from_cb  # 绑定点击事件
         )
-        self.ui_lock_cb.pack(side=tk.BOTTOM, fill=tk.X)
+        self.ui_lock_cb.pack(side=ctk.BOTTOM, fill=ctk.X,pady=5)
         self.start_hotkey_listener() #启用快捷键监听
+
+        # 玩家箭头显示开启
+        self.player_arrow_enable_var = ctk.BooleanVar(value=True)
+        self.player_arrow_enable_cb = ctk.CTkCheckBox(
+            self.ctrl_frame, text="开启玩家箭头显示",
+            variable=self.player_arrow_enable_var,
+        )
+        self.player_arrow_enable_cb.pack(side=ctk.BOTTOM, fill=tk.X, pady=5)
 
         # 重置按钮
         log_step("正在加载按钮")
-        self.reset_btn = tk.Button(
-            root,
-            text="手动重置定位 (全图扫描)",
+        self.reset_btn = ctk.CTkButton(
+            self.ctrl_frame, text="手动重置定位 (全图扫描)",
             command=self.reset_location,
-            bg='#3c3f41',
-            fg='white',
-            activebackground='#4b4e50',
-            activeforeground='white',
-            relief=tk.FLAT,
-            pady=5
         )
-        self.reset_btn.pack(side=tk.BOTTOM, fill=tk.X)  # 放在底部并水平铺满
+        self.reset_btn.pack(side=ctk.BOTTOM, fill=tk.X,pady=5)  # 放在底部并水平铺满
 
         # -- 清空已采集按钮
-        self.reset_collect_btn = tk.Button(
-            root,
-            text="重置所有已采集",
+        self.reset_collect_btn = ctk.CTkButton(
+            self.ctrl_frame, text="重置所有已采集",
+            fg_color="#4a2b2b", hover_color="#6e3a3a",
             command=self.reset_picking_data,
-            bg='#4a2b2b',  # 深红色背景提示风险
-            fg='white',
-            activebackground='#6e3a3a',
-            activeforeground='white',
-            pady=5
         )
         # 放在自动采集开关下方，全图预览上方
-        self.reset_collect_btn.pack(side=tk.BOTTOM, fill=tk.X)
+        self.reset_collect_btn.pack(side=ctk.BOTTOM, fill=tk.X,pady=5)
 
-        # -- 自动采集按钮
-        self.auto_collect_var = tk.BooleanVar(value=False)
-        self.auto_collect_cb = tk.Checkbutton(
-            root,
-            text="开启图标自动标记",
-            variable=self.auto_collect_var,
-            bg='#2b2b2b',
-            fg='white',
-            selectcolor='#3c3f41',
-            activebackground='#2b2b2b',
-            activeforeground='white'
-        )
-        self.auto_collect_cb.pack(side=tk.BOTTOM, fill=tk.X)
-
-        # -- 开启最近路线规划
-        self.auto_route_planning_var = tk.BooleanVar(value=False)
-        self.auto_route_planning_cb = tk.Checkbutton(
-            root,
-            text="开启最近路线规划(需开启图标自动标记)",
-            variable=self.auto_route_planning_var,
-            bg='#2b2b2b',
-            fg='white',
-            selectcolor='#3c3f41',
-            activebackground='#2b2b2b',
-            activeforeground='white'
-        )
-        self.auto_route_planning_cb.pack(side=tk.BOTTOM, fill=tk.X)
 
         # -- 下拉选择资源类型
         log_step("正在加载下拉菜单")
@@ -375,19 +789,76 @@ class MapTrackerApp:
         self.resource_type_vars = {}
         self.resource_type_popup = None
         self.resource_type_text = "请选择"
-        self.resource_type_button = tk.Button(root, text=self.resource_type_text, relief="groove",
-                                bg="white", anchor="w", command=self.resource_type_toggle_popup)
-        self.resource_type_button.pack(fill="x", expand=True)
+        self.resource_type_button = ctk.CTkButton(
+            self.ctrl_frame, text=self.resource_type_text,
+            command=self.resource_type_toggle_popup)
+        self.resource_type_button.pack(side=ctk.BOTTOM,fill="x", expand=True,pady=5)
 
 
         # -- 大地图按钮
         log_step("正在加载大地图按钮")
-        self.big_map_btn = tk.Button(
-            root, text="打开大地图预览", command=self.open_big_map,
-            bg='#3c3f41', fg='white', pady=5
+        self.big_map_btn = ctk.CTkButton(
+            self.ctrl_frame, text="打开大地图预览", command=self.open_big_map
         )
-        self.big_map_btn.pack(side=tk.BOTTOM, fill=tk.X)
+        self.big_map_btn.pack(side=ctk.BOTTOM, fill=ctk.X,pady=5)
 
+        # 地图缩放控制
+        self.zoom_var = ctk.DoubleVar(value=1.0)
+        self.zoom_frame = ctk.CTkFrame(self.ctrl_frame, fg_color="transparent")
+        self.zoom_frame.pack(side=ctk.BOTTOM, fill=tk.X, pady=5)
+
+        self.zoom_label = ctk.CTkLabel(self.zoom_frame, text="地图缩放: 1.0x", width=80)
+        self.zoom_label.pack(side=ctk.LEFT, padx=(0, 5))
+
+        def on_zoom_change(val):
+            self.zoom_label.configure(text=f"地图缩放: {float(val):.1f}x")
+
+        self.zoom_slider = ctk.CTkSlider(
+            self.zoom_frame,
+            from_=0.5, to=2.0,
+            variable=self.zoom_var,
+            number_of_steps=12,
+            command=on_zoom_change
+        )
+        self.zoom_slider.pack(side=ctk.LEFT, fill=tk.X, expand=True)
+
+        # -- 开启图标自动标记
+        self.auto_collect_var = ctk.BooleanVar(value=False)
+        self.auto_collect_cb = ctk.CTkCheckBox(
+            self.ctrl_frame, text="开启图标自动标记",
+            variable=self.auto_collect_var,
+        )
+        self.auto_collect_cb.pack(side=ctk.BOTTOM, fill=tk.X, pady=5)
+
+        # -- 开启最近路线规划
+        self.auto_route_planning_var = ctk.BooleanVar(value=False)
+        self.auto_route_planning_cb = ctk.CTkCheckBox(
+            self.ctrl_frame, text="开启最近路线规划(与自定义路线冲突)",
+            variable=self.auto_route_planning_var,
+            command=self.on_auto_route_toggle
+        )
+        self.auto_route_planning_cb.pack(side=ctk.BOTTOM, fill=tk.X, pady=5)
+
+        # -- 自定义路线
+        self.available_routes = glob.glob(os.path.join(CUSTOM_ROUTES_DIR, "*.json"))
+        route_names = [os.path.basename(r) for r in self.available_routes]
+        self.route_var = tk.StringVar(value=route_names[0] if route_names else "")
+        self.use_custom_route_var = tk.BooleanVar(value=False)
+
+        # -- 下拉选择框
+        self.chk_custom_route = ctk.CTkCheckBox(
+            self.ctrl_frame, text="启用自定义路线",
+            variable=self.use_custom_route_var,
+            command=self.on_route_toggle)
+        self.chk_custom_route.pack(side=ctk.BOTTOM, fill=tk.X, pady=5)
+
+        self.route_combobox = ctk.CTkComboBox(
+            self.ctrl_frame,
+            values=route_names,
+            variable=self.route_var,
+            command=self.on_route_combobox_change  # 增加事件联动
+        )
+        self.route_combobox.pack(side=ctk.BOTTOM, fill=tk.X,pady=5)
 
         # 多线程初始化
         log_step("尝试初始化多线程")
@@ -403,6 +874,7 @@ class MapTrackerApp:
 
 
         # 启动截图线程
+        self.minimap_np = None
         log_step("尝试启动截图线程")
         self.capture_thread = threading.Thread(target=self.capture_loop, daemon=True)
         self.capture_thread.start()
@@ -422,6 +894,9 @@ class MapTrackerApp:
         self.smooth_x = None
         self.smooth_y = None
         self.lerp_factor = 0.45
+
+        # --- 用于方向识别的变量
+        self.current_angle = 0.0  # 目标角度
 
         # -- 拖动性能优化
         self.is_dragging = False
@@ -507,9 +982,13 @@ class MapTrackerApp:
         self.resource_type_options = list(resource_type_dicts.keys())
         # 默认全选
         self.resource_type_selected_items = self.resource_type_options.copy()
-        self.resource_type_button.config(text=f"过滤资源: 已选 {len(self.resource_type_options)} 类")
+        self.resource_type_button.configure(text=f"过滤资源: 已选 {len(self.resource_type_options)} 类")
 
         self.marker_data = self.load_markers(config.POINTS_PATH)
+        self.custom_markers = self.load_custom_markers()
+        self.marker_data.extend(self.custom_markers)  # 将自定义标点合并到总池，享受同等渲染和自动采集待遇
+
+        self.markers_np_coords = np.array([[m['pixel_x'], m['pixel_y']] for m in self.marker_data], dtype=np.float32)
         # 加载图标并缓存（包含灰色版本）
         self.icon_cache = self.prep_icons(r"assest/icons")
         log_step(f"已加载图标并缓存")
@@ -560,13 +1039,28 @@ class MapTrackerApp:
                     if self.status_text_id:
                         self.canvas.itemconfig(self.status_text_id, state="hidden")
 
-                    half_view = config.VIEW_SIZE // 2
-                    x1, y1 = center_x - half_view, center_y - half_view
-                    x2, y2 = center_x + half_view, center_y + half_view
+                    # 获取当前画板真实的物理尺寸
+                    view_w = self.canvas.winfo_width()
+                    view_h = self.canvas.winfo_height()
 
-                    # 大地地图边缘越界情况处理
-                    bg_canvas = np.zeros((config.VIEW_SIZE, config.VIEW_SIZE, 3), dtype=np.uint8)
-                    bg_canvas[:] = (43, 43, 43)
+                    # 防御性判定：Tkinter 刚启动时 winfo_width 可能返回 1，此时使用配置作为兜底
+                    if view_w <= 10 or view_h <= 10:
+                        view_w, view_h = config.VIEW_SIZE, config.VIEW_SIZE
+
+                    # 获取缩放比例并计算裁剪尺寸
+                    zoom_scale = self.zoom_var.get()
+
+                    # 基于缩放反推需要在大地图上截取的物理范围大小
+                    crop_w = max(10, int(view_w / zoom_scale))
+                    crop_h = max(10, int(view_h / zoom_scale))
+                    half_crop_w, half_crop_h = crop_w // 2, crop_h // 2
+
+                    x1, y1 = int(center_x - half_crop_w), int(center_y - half_crop_h)
+                    x2, y2 = x1 + crop_w, y1 + crop_h
+
+                    # 动态生成用于裁剪的原图底板
+                    bg_crop = np.zeros((crop_h, crop_w, 3), dtype=np.uint8)
+                    bg_crop[:] = (43, 43, 43)
 
                     # 计算在原图上截取的合法范围
                     map_x1, map_y1 = max(0, x1), max(0, y1)
@@ -574,14 +1068,19 @@ class MapTrackerApp:
 
                     # 只有当截取范围有效时才进行像素复制
                     if map_x1 < map_x2 and map_y1 < map_y2:
-                        # 计算在固定底板(bg_canvas)上的粘贴范围 (自动处理负坐标导致的偏移量)
                         paste_x1 = map_x1 - x1
                         paste_y1 = map_y1 - y1
                         paste_x2 = paste_x1 + (map_x2 - map_x1)
                         paste_y2 = paste_y1 + (map_y2 - map_y1)
 
                         # 将合法部分的地图贴到底板上，确保坐标系绝对对齐
-                        bg_canvas[paste_y1:paste_y2, paste_x1:paste_x2] = self.logic_map_bgr[map_y1:map_y2, map_x1:map_x2]
+                        bg_crop[paste_y1:paste_y2, paste_x1:paste_x2] = self.logic_map_bgr[map_y1:map_y2, map_x1:map_x2]
+
+                    # 根据缩放比例通过 OpenCV 将原图缩放到视口大小
+                    if zoom_scale != 1.0:
+                        bg_canvas = cv2.resize(bg_crop, (view_w, view_h), interpolation=cv2.INTER_LINEAR)
+                    else:
+                        bg_canvas = bg_crop
 
                     # 将拼合好的底板转换为图片
                     pil_bg = Image.fromarray(cv2.cvtColor(bg_canvas, cv2.COLOR_BGR2RGB))
@@ -594,12 +1093,98 @@ class MapTrackerApp:
                     else:
                         self.canvas.itemconfig(self.bg_image_id, image=self.tk_bg_image, state="normal")
 
+                    # 清除渲染堆叠
+                    self.canvas.delete("player_indicator")
+                    self.canvas.delete("route_line") #旧路线
+
+                    # 绘制玩家位置箭头与圆圈参数预计算
+                    ui_center_x = view_w // 2
+                    ui_center_y = view_h // 2
+                    radius = 8  # 圆圈半径
+
+                    bbox = [ui_center_x - radius, ui_center_y - radius,
+                            ui_center_x + radius, ui_center_y + radius]
+
+                    radius_picking = radius + int(config.PICKING_RADIUS * (view_w / crop_w)) # 黄圈在 UI 视觉上跟随底图同步放大或缩小
+                    bbox_picking = [ui_center_x - radius_picking, ui_center_y - radius_picking,
+                            ui_center_x + radius_picking, ui_center_y + radius_picking]
+
+                    if (
+                            self.player_arrow_enable_var.get()
+                            and self.minimap_np is not None
+                    ):
+                        # --- 截取小地图中心图案并贴在 UI 上 ---
+                        try:
+                            h_mini, w_mini = self.minimap_np.shape[:2]
+                            cx, cy = w_mini // 2, h_mini // 2
+
+                            crop_radius = 30  # 设置截取半径 默认 30
+
+                            # 动态计算玩家箭头的显示尺寸
+                            base_display_size = 68  # 默认尺寸 68
+                            current_zoom = view_w / crop_w if 'crop_w' in locals() and crop_w > 0 else 1.0
+                            display_size = max(16, int(base_display_size * current_zoom)) # 乘以缩放倍率，并限制最小尺寸防崩溃
+
+                            opacity = 0.7  # 透明度
+
+                            # 防止画面边缘越界保护
+                            if cy - crop_radius >= 0 and cy + crop_radius <= h_mini and cx - crop_radius >= 0 and cx + crop_radius <= w_mini:
+                                # 截取
+                                roi = self.minimap_np[
+                                    cy - crop_radius: cy + crop_radius, cx - crop_radius: cx + crop_radius]
+
+                                # 转换颜色和透明度
+                                rgba_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2RGBA)
+
+                                # 制作圆形遮罩 (注意：遮罩大小需与 crop_radius 对应)
+                                mask_size = crop_radius * 2
+                                mask = np.zeros((mask_size, mask_size), dtype=np.uint8)
+                                alpha_value = int(255 * opacity)
+                                cv2.circle(mask, (crop_radius, crop_radius), crop_radius, alpha_value, -1)
+                                rgba_roi[:, :, 3] = mask
+
+
+                                # 转换为 PIL 对象
+                                pil_arrow = Image.fromarray(rgba_roi)
+
+                                # 使用 LANCZOS 进行高质量缩放
+                                pil_arrow = pil_arrow.resize((display_size, display_size), Image.Resampling.LANCZOS)
+
+                                self.tk_player_arrow = ImageTk.PhotoImage(pil_arrow)
+
+                                # 绘制到画板中心
+                                self.canvas.create_image(
+                                    ui_center_x, ui_center_y,
+                                    anchor=tk.CENTER,
+                                    image=self.tk_player_arrow,
+                                    tags="player_indicator"
+                                )
+                        except Exception as e:
+                            log_step(f"小地图箭头截取/缩放报错：{e}")
+
+
                     # 独立管理图标 (不修改底图像素)
                     if not hasattr(self, 'canvas_icons'):
                         self.canvas_icons = {}
 
-                    # 遍历所有标记，决定移动、显示还是隐藏
-                    for m in self.marker_data:
+                    # 快速过滤出在矩形范围内的点的索引
+                    valid_idx = np.where(
+                        (self.markers_np_coords[:, 0] >= x1) &
+                        (self.markers_np_coords[:, 0] <= x2) &
+                        (self.markers_np_coords[:, 1] >= y1) &
+                        (self.markers_np_coords[:, 1] <= y2)
+                    )[0]
+
+                    # 隐藏不在范围内的点
+                    visible_ids = set([self.marker_data[i]['id'] for i in valid_idx])
+                    for m_id, item_id in self.canvas_icons.items():
+                        if m_id not in visible_ids:
+                            self.canvas.itemconfig(item_id, state="hidden")
+
+                    # 仅对视锥范围内的点进行精准计算和渲染
+                    cull_dist = max(250, int(250 / zoom_scale))
+                    for i in valid_idx:
+                        m = self.marker_data[i]
                         m_id = m['id']
                         m_type = m['type']
 
@@ -626,23 +1211,26 @@ class MapTrackerApp:
 
                         # 视锥剔除与距离计算
                         if x1 <= m['pixel_x'] <= x2 and y1 <= m['pixel_y'] <= y2:
-                            dist = ((m['pixel_x'] - center_x)**2 + (m['pixel_y'] - center_y)**2)**0.5
+                            dist = ((m['pixel_x'] - center_x) ** 2 + (m['pixel_y'] - center_y) ** 2) ** 0.5
 
-                            if dist > 250:
+                            # ---------- [修改开始] 根据缩放比例动态调整剔除距离阈值 ----------
+                            cull_dist = max(250, int(250 / zoom_scale))
+                            if dist > cull_dist:
                                 # 距离过远，如果在画布上则隐藏
                                 if m_id in self.canvas_icons:
                                     self.canvas.itemconfig(self.canvas_icons[m_id], state="hidden")
                                 continue
 
-                            # 自动采集逻辑
+                            # 自动采集逻辑 (距离判定保持原大地图物理距离，不受缩放干扰)
                             if self.auto_collect_var.get() and dist < config.PICKING_RADIUS and not m['is_collected']:
                                 m['is_collected'] = True
                                 need_save = True
                                 if DEBUG_MODE:
                                     log_step(f"DEBUG: 自动采集资源点 {m['id']} (类型: {m['type']})")
 
-                            # 计算在 Canvas 上的相对坐标
-                            rx, ry = int(m['pixel_x'] - x1), int(m['pixel_y'] - y1)
+                            # 计算在 Canvas 上的相对坐标，并加入真实的缩放乘数因子
+                            rx = int((m['pixel_x'] - x1) * (view_w / crop_w))
+                            ry = int((m['pixel_y'] - y1) * (view_h / crop_h))
 
                             icon_set = self.icon_cache.get(m['type'])
                             if not icon_set: continue
@@ -651,45 +1239,40 @@ class MapTrackerApp:
 
                             # 如果 Canvas 上还没这个图标，创建它
                             if m_id not in self.canvas_icons:
-                                item_id = self.canvas.create_image(rx, ry, anchor=tk.CENTER, image=target_img)
+                                item_id = self.canvas.create_image(
+                                    rx, ry,
+                                    anchor=tk.CENTER,
+                                    image=target_img,
+                                    tags="resource_icon"
+                                )
                                 self.canvas_icons[m_id] = item_id
                             else:
                                 # 如果已存在，仅更新位置、图片和状态（恢复显示）
                                 item_id = self.canvas_icons[m_id]
+                                self.canvas.itemconfig(item_id, image=target_img, state="normal", tags="resource_icon")
                                 self.canvas.coords(item_id, rx, ry)
-                                self.canvas.itemconfig(item_id, image=target_img, state="normal")
                         else:
                             # 视野外，如果有对应的 item 则隐藏
                             if m_id in self.canvas_icons:
                                 self.canvas.itemconfig(self.canvas_icons[m_id], state="hidden")
 
-                    # 绘制玩家位置圆圈
-                    view_w = config.VIEW_SIZE
-                    view_h = config.VIEW_SIZE
-                    center_x = view_w // 2
-                    center_y = view_h // 2
-                    radius = 8  # 圆圈半径
-
-                    bbox = [center_x - radius, center_y - radius,
-                            center_x + radius, center_y + radius]
-
-                    radius_picking = radius + config.PICKING_RADIUS
-                    bbox_picking = [center_x - radius_picking, center_y - radius_picking,
-                            center_x + radius_picking, center_y + radius_picking]
-                    # 清除渲染堆叠
-                    self.canvas.delete("player_indicator")
-                    self.canvas.delete("route_line") #旧路线
-
                     # 路线规划绘制逻辑
-                    if getattr(self, 'auto_route_planning_var', None) and self.auto_route_planning_var.get() and self.found:
+                    if (
+                            getattr(self, 'auto_route_planning_var',None)
+                            and self.auto_route_planning_var.get()
+                            and self.found
+                    ):
                         route_markers = self.calculate_collection_route(self.smooth_x, self.smooth_y, num_points=10)
                         if route_markers:
+                            # ---------- [修改开始] ----------
                             # 路线的起点是屏幕中心的玩家位置
-                            prev_x, prev_y = center_x, center_y
+                            # (原代码这里有 Bug: center_x 是大地图坐标，会导致连线从几千像素外飞来，修复为 UI 画布中心点坐标)
+                            prev_x, prev_y = ui_center_x, ui_center_y
 
                             for idx, m in enumerate(route_markers):
-                                # 将大地图绝对坐标转换为 Canvas 相对坐标
-                                rx, ry = int(m['pixel_x'] - x1), int(m['pixel_y'] - y1)
+                                # 将大地图绝对坐标转换为 Canvas 相对坐标，并适配缩放
+                                rx = int((m['pixel_x'] - x1) * (view_w / crop_w))
+                                ry = int((m['pixel_y'] - y1) * (view_h / crop_h))
 
                                 # 绘制连线 (带箭头，青色虚线)
                                 self.canvas.create_line(
@@ -709,14 +1292,22 @@ class MapTrackerApp:
                                 # 迭代下一个起点
                                 prev_x, prev_y = rx, ry
 
+                    if getattr(self, 'use_custom_route_var', None) and self.use_custom_route_var.get() and self.found:
+                        self.render_active_route(x1, y1, view_w, crop_w, view_h, crop_h, ui_center_x, ui_center_y)
+
                     # 采集范围圈
                     self.canvas.create_oval(bbox_picking, outline="yellow",dash=(4,2), width=1, tags="player_indicator")
                     if self.found:
                         # 定位成功：画红圈
-                        self.canvas.create_oval(bbox, outline="red", width=2, tags="player_indicator")
+                        if not self.player_arrow_enable_var.get():
+                            self.canvas.create_oval(bbox, outline="red", width=2, tags="player_indicator")
                     else:
                         # 定位丢失：画白圈
                         self.canvas.create_oval(bbox, outline="white", width=2, tags="player_indicator")
+
+                    # 强制将所有资源图标和路线提升到最高层级
+                    self.canvas.tag_raise("resource_icon")
+                    self.canvas.tag_raise("route_line")
             else:
                 # 隐藏地图底图和所有图标
                 if hasattr(self, 'bg_image_id') and self.bg_image_id:
@@ -726,22 +1317,32 @@ class MapTrackerApp:
                 self.canvas.itemconfigure("all", state="hidden")
 
                 # 显示或更新提示文字
-                self.empty_display_text = "计算匹配定位锚点中...\n请勿用任何窗口遮挡小地图，包括本软件！\n建议全屏游戏以保证小地图显示最大\n\n在此页面卡住超过10分钟\n是win显示设置缩放不为100%导致的"
-                center_pt = config.VIEW_SIZE // 2
+                self.empty_display_text = ("计算匹配定位锚点中...\n"
+                                           "请勿用任何窗口遮挡小地图，包括本软件！\n"
+                                           "建议全屏游戏以保证小地图显示最大\n\n"
+                                           "在此页面卡住超过10分钟\n"
+                                           "是win显示设置缩放不为100%导致的")
+
+                # 再次获取真实尺寸（针对初始还没定位成功时的画布拉伸）
+                view_w = self.canvas.winfo_width()
+                view_h = self.canvas.winfo_height()
+                if view_w <= 10 or view_h <= 10:
+                    view_w, view_h = config.VIEW_SIZE, config.VIEW_SIZE
 
                 if not self.status_text_id:
-                    # 第一次创建：白色文字，带一点点阴影效果（创建两个 text）
                     self.status_text_id = self.canvas.create_text(
-                        center_pt, center_pt,
+                        view_w // 2, view_h // 2,
                         text=self.empty_display_text,
-                        fill="white",
+                        fill="black",
                         font=("微软雅黑", 14, "bold"),
-                        justify=tk.CENTER,
+                        anchor="center",
+                        justify="center",
                         tags="status_msg"
                     )
-
                 else:
                     self.canvas.itemconfig(self.status_text_id, state="normal", text=self.empty_display_text)
+                    # 动态更新坐标，确保窗口被拖拽时文字始终居中
+                    self.canvas.coords(self.status_text_id, view_w // 2, view_h // 2)
                     self.canvas.tag_raise(self.status_text_id)
 
             if need_save and int(time.time() * 10) % 10 == 0:
@@ -854,7 +1455,7 @@ class MapTrackerApp:
         """
         计算从指定坐标开始的连续最近采集路线
         """
-        # 1. 获取当前需要显示的、未采集的可用资源点
+        # 获取当前需要显示的、未采集的可用资源点
         valid_markers = []
         for m in self.marker_data:
             if m.get('is_collected'):
@@ -879,26 +1480,27 @@ class MapTrackerApp:
         if not valid_markers:
             return []
 
-        route = []
-        current_x, current_y = start_x, start_y
+        # 提取坐标为 NumPy 数组
+        coords = np.array([[m['pixel_x'], m['pixel_y']] for m in valid_markers])
         candidates = valid_markers.copy()
+        route = []
 
-        # 2. 贪心算法：每次找距离当前坐标最近的下一个点
+        curr_pt = np.array([start_x, start_y])
+
         for _ in range(min(num_points, len(candidates))):
-            nearest_m = None
-            min_dist_sq = float('inf')
+            # 向量化计算当前点到所有候选点的距离平方
+            dists_sq = np.sum((coords - curr_pt) ** 2, axis=1)
+            nearest_idx = np.argmin(dists_sq)
 
-            for m in candidates:
-                dist_sq = (m['pixel_x'] - current_x) ** 2 + (m['pixel_y'] - current_y) ** 2
-                if dist_sq < min_dist_sq:
-                    min_dist_sq = dist_sq
-                    nearest_m = m
+            nearest_m = candidates[nearest_idx]
+            route.append(nearest_m)
 
-            if nearest_m:
-                route.append(nearest_m)
-                candidates.remove(nearest_m)
-                # 更新当前坐标为刚找到的资源点，以便寻找下一段路线
-                current_x, current_y = nearest_m['pixel_x'], nearest_m['pixel_y']
+            # 更新当前点
+            curr_pt = coords[nearest_idx]
+
+            # 从候选池中删除已选点
+            candidates.pop(nearest_idx)
+            coords = np.delete(coords, nearest_idx, axis=0)
 
         return route
 
@@ -1051,6 +1653,7 @@ class MapTrackerApp:
                     # 截图
                     screenshot = sct.grab(MINIMAP_DATA)
                     minimap_bgr = np.array(screenshot)
+                    self.minimap_np = minimap_bgr[:, :, :3]
 
                     # 如果图片极大面积是纯黑，说明游戏屏蔽了截图或全屏了
                     if np.mean(minimap_bgr) < 5:
@@ -1121,7 +1724,7 @@ class MapTrackerApp:
 
                         if len(near_indices) > 20:
                             current_des_big = self.des_big[near_indices]
-                            current_kp_big = [self.kp_big[i] for i in near_indices]
+                            # current_kp_big = [self.kp_big[i] for i in near_indices]
                         else:
                             self.consecutive_failures = self.global_search_threshold
                             continue
@@ -1150,16 +1753,19 @@ class MapTrackerApp:
 
                     if len(good_matches) >= config.ORB_MIN_MATCH_COUNT:
                         src_pts = np.float32([kp_mini[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-                        dst_pts = np.float32([current_kp_big[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
 
-                        #M, inliers = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC,ransacReprojThreshold=3.0) #部分仿射变换
+                        if is_global_mode:
+                            dst_pts = np.float32([current_kp_big[m.trainIdx].pt for m in good_matches]).reshape(-1, 1,2)
+                        else:
+                            dst_pts = np.float32([self.kp_big[near_indices[m.trainIdx]].pt for m in good_matches]).reshape(-1, 1, 2)
 
                         # 降低重投影误差阈值到 1.5，提高精度；增加迭代次数，保证能找到最优解
                         M, inliers = cv2.estimateAffinePartial2D(
                             src_pts, dst_pts,
                             method=cv2.RANSAC,
                             ransacReprojThreshold=1.5,
-                            maxIters=2000
+                            maxIters=TOOL_SETTINGS.get(str(SETTING_VAR)).get("maxIters"),
+                            confidence=0.98
                         )
 
                         if M is not None:
@@ -1237,10 +1843,18 @@ class MapTrackerApp:
         log_step(">>> 已手动重置定位系统，正在尝试全图重新定位...")
 
     def open_big_map(self):
-        # 确保 logic_map_bgr 已经转为 PIL 格式
         pil_full_map = Image.fromarray(cv2.cvtColor(self.logic_map_bgr, cv2.COLOR_BGR2RGB))
-        # 打开新窗口
-        BigMapWindow(self.root, pil_full_map, self.marker_data, self.icon_cache, self.resource_type_selected_items)
+        # 核心：将系统标点和自定义标点完全分离开，并将主程序自己 (self) 传给大地图
+        system_markers = [m for m in self.marker_data if not m.get('is_custom')]
+        BigMapWindow(
+            self.root,
+            pil_full_map,
+            system_markers,
+            self.custom_markers,
+            self.icon_cache,
+            self.resource_type_selected_items,
+            parent_app=self
+        )
 
     def on_window_configure(self, event):
         # 增加类型判断
@@ -1293,11 +1907,95 @@ class MapTrackerApp:
         except Exception as e:
             messagebox.showerror("重置失败", f"发生错误: {e}")
 
+    def get_marker_by_id(self, marker_id):
+        """通过 ID 查找标点"""
+        for m in self.marker_data:
+            if m['id'] == marker_id:
+                return m
+        return None
+
+    def load_custom_markers(self):
+        """解析自定义点位 JSON，确保类型键统一"""
+        custom_points_path = os.path.join(CUSTOM_POINTS_DIR, "user_points.json")
+        custom_markers = []
+        if os.path.exists(custom_points_path):
+            try:
+                collected_ids = self.load_picking_data(config.PICKINGDATA_PATH)
+                with open(custom_points_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    for type_str, point_list in data.items():
+                        for pt in point_list:
+                            m_id = pt.get('id')
+                            lat = pt.get('point', {}).get('lat')
+                            lng = pt.get('point', {}).get('lng')
+                            mark_type = str(pt.get('markType', '301'))
+
+                            if lat is not None and lng is not None:
+                                custom_markers.append({
+                                    'id': m_id,
+                                    'type': mark_type,  # 统一使用 type 供小地图识别
+                                    'markType': mark_type,  # 供编辑功能识别
+                                    'pixel_x': lng,
+                                    'pixel_y': lat,
+                                    'is_collected': m_id in collected_ids,
+                                    'is_custom': True
+                                })
+            except Exception as e:
+                print(f"加载自定义标点失败: {e}")
+        return custom_markers
+
+    def render_active_route(self, x1, y1, view_w, crop_w, view_h, crop_h, ui_center_x, ui_center_y):
+        """增强版：绘制自定义路线，包含从玩家到目标的绝对实线"""
+        try:
+            if not getattr(self, 'use_custom_route_var', None) or not self.use_custom_route_var.get():
+                return
+            if not hasattr(self, 'active_route_data') or not self.active_route_data:
+                return
+
+            # 过滤掉已被采集（隐藏）的节点
+            valid_nodes = []
+            for node in self.active_route_data.get('nodes', []):
+                marker = self.get_marker_by_id(node['id'])
+                if marker and not marker.get('is_collected', False):
+                    valid_nodes.append(marker)
+
+            if not valid_nodes:
+                return
+
+            # --- 画出玩家当前位置到第一个未采集标点的引导线 ---
+            first_m = valid_nodes[0]
+            first_rx = int((first_m['pixel_x'] - x1) * (view_w / crop_w))
+            first_ry = int((first_m['pixel_y'] - y1) * (view_h / crop_h))
+
+            # 红色实线
+            self.canvas.create_line(
+                ui_center_x, ui_center_y, first_rx, first_ry,
+                fill="#FF00FF", width=3, dash=(4, 2), arrow=tk.LAST, tags="route_line"
+            )
+
+            # 绘制后续标点之间的路线连线 (蓝色虚线)
+            for i in range(len(valid_nodes) - 1):
+                m1 = valid_nodes[i]
+                m2 = valid_nodes[i + 1]
+
+                rx1 = int((m1['pixel_x'] - x1) * (view_w / crop_w))
+                ry1 = int((m1['pixel_y'] - y1) * (view_h / crop_h))
+                rx2 = int((m2['pixel_x'] - x1) * (view_w / crop_w))
+                ry2 = int((m2['pixel_y'] - y1) * (view_h / crop_h))
+
+                self.canvas.create_line(
+                    rx1, ry1, rx2, ry2,
+                    fill="#3399FF", width=3, dash=(4, 2), arrow=tk.LAST, tags="route_line"
+                )
+
+        except Exception as e:
+            log_step(f"渲染自定义路线发生了错误: {e}")
+
     def init_big_map_features(self):
         cache_file = config.FEATURES_PATH
 
         # 构建地图特征池提示
-        self.status_label.config(text="正在构建地图特征池，请稍候...")
+        self.status_label.configure(text="正在构建地图特征池，请稍候...")
         self.root.update()  # 刷新文字
 
         # 检查缓存是否存在
@@ -1313,7 +2011,7 @@ class MapTrackerApp:
         # 如果缓存不存在，则正常计算
         log_step("正在初次计算大地图特征点，请稍候...")
 
-        self.status_label.config(text="正在构建地图特征池：计算 ORB 特征点 (耗时较长)...")
+        self.status_label.configure(text="正在构建地图特征池：计算 ORB 特征点 (耗时较长)...")
         self.root.update()  # 再次刷新
 
         self.build_multi_scale_feature_pool()
@@ -1383,13 +2081,13 @@ class MapTrackerApp:
     def resource_type_update_selection(self):
         self.resource_type_selected_items = [opt for opt, var in self.resource_type_vars.items() if var.get()]
         if not self.resource_type_selected_items:
-            self.resource_type_button.config(text="请选择")
+            self.resource_type_button.configure(text="请选择")
         else:
             text = ", ".join(self.resource_type_selected_items)
             # 如果太长，显示数量
             if len(text) > 20:
                 text = f"已选择 {len(self.resource_type_selected_items)} 项"
-            self.resource_type_button.config(text=text)
+            self.resource_type_button.configure(text=text)
 
     def resource_type_close_popup(self):
         if self.resource_type_popup:
@@ -1403,18 +2101,23 @@ class MapTrackerApp:
     def start_hotkey_listener(self):
         """使用 pynput 监听全局快捷键"""
 
-        def on_activate():
-            # 当按下 Alt+L 时触发
-            # 注意：pynput 在独立线程运行，修改 UI 必须回到主线程
-            log_step("检测到触发快捷键ALT+L")
+        def on_activate_l():
+            # 必须通过 root.after 调度到主线程执行，防止线程崩溃
+            log_step("检测到触发快捷键 ALT+L (鼠标穿透锁定)")
             self.root.after(0, self.hotkey_triggered)
+
+        def on_activate_i():
+            # 必须通过 root.after 调度到主线程执行
+            log_step("检测到触发快捷键 ALT+I (显示/隐藏面板)")
+            self.root.after(0, self.toggle_ctrl_frame)
 
         # 注意：这里的键名必须是小写，组合用 + 号
         # <alt>+l 代表 Alt + L
         try:
             # 实例化 GlobalHotkeys
             listener = keyboard.GlobalHotKeys({
-                '<alt>+l': on_activate
+                '<alt>+l': on_activate_l,
+                '<alt>+i': on_activate_i
             })
             listener.daemon = True # 设置为守护线程，随主程序退出
             listener.start()
@@ -1447,13 +2150,73 @@ class MapTrackerApp:
                 # 添加透明穿透属性：WS_EX_TRANSPARENT 允许鼠标穿透
                 # WS_EX_LAYERED 是必须的，否则穿透无效
                 ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style | WS_EX_LAYERED | WS_EX_TRANSPARENT)
-                self.ui_lock_cb.config(fg="#00FF00") # 锁定状态变绿提醒
+                self.ui_lock_cb.configure(fg="#00FF00") # 锁定状态变绿提醒
             else:
                 # 移除穿透属性
                 ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style & ~WS_EX_TRANSPARENT)
-                self.ui_lock_cb.config(fg="white")
+                self.ui_lock_cb.configure(fg="white")
         except Exception as e:
             print(f"设置UI锁定失败: {e}")
+
+    def on_route_toggle(self):
+        if self.use_custom_route_var.get():
+            self.auto_route_planning_var.set(False)  # 互斥：关闭最近路线
+            self.load_active_custom_route()
+
+    def on_auto_route_toggle(self):
+        if getattr(self, 'auto_route_planning_var', None) and self.auto_route_planning_var.get():
+            self.use_custom_route_var.set(False)  # 互斥：关闭自定义路线
+
+    def load_active_custom_route(self):
+        """带容错的路线读取"""
+        try:
+            route_name = self.route_var.get()
+            if not route_name:
+                return
+            route_file = os.path.join(CUSTOM_ROUTES_DIR, route_name)
+            if os.path.isfile(route_file):
+                with open(route_file, 'r', encoding='utf-8') as f:
+                    self.active_route_data = json.load(f)
+        except Exception as e:
+            log_step(f"加载路线文件失败: {e}")
+
+    def on_custom_marker_added(self, new_marker):
+        """实时将大地图的新增标点注入到小地图系统中"""
+        self.marker_data.append(new_marker)
+        self.custom_markers.append(new_marker)
+        self.markers_np_coords = np.array([[m['pixel_x'], m['pixel_y']] for m in self.marker_data], dtype=np.float32)
+
+    def on_custom_marker_deleted(self, marker):
+        """实时删除标点"""
+        if marker in self.marker_data:
+            self.marker_data.remove(marker)
+        if marker in self.custom_markers:
+            self.custom_markers.remove(marker)
+        self.markers_np_coords = np.array([[m['pixel_x'], m['pixel_y']] for m in self.marker_data], dtype=np.float32)
+
+    def refresh_route_list(self):
+        """实时刷新路线下拉框"""
+        self.available_routes = glob.glob(os.path.join(CUSTOM_ROUTES_DIR, "*.json"))
+        route_names = [os.path.basename(r) for r in self.available_routes]
+        self.route_combobox.configure(values=route_names)
+        if route_names and not self.route_var.get():
+            self.route_var.set(route_names[0])
+
+    def on_route_combobox_change(self, choice):
+        """当用户在下拉框选择了其他路线时，立刻刷新路线"""
+        if self.use_custom_route_var.get():
+            self.load_active_custom_route()
+
+    def toggle_ctrl_frame(self):
+        """切换控制面板的显示/隐藏状态"""
+        self.ui_hidden = not self.ui_hidden
+        if self.ui_hidden:
+            self.ctrl_frame.pack_forget()  # 隐藏大面板
+            self.btn_show_ctrl.pack(side=ctk.BOTTOM, fill=ctk.X, pady=2)  # 显示小按钮
+        else:
+            self.btn_show_ctrl.pack_forget()  # 隐藏小按钮
+            self.ctrl_frame.pack(side=ctk.BOTTOM, fill=ctk.X, padx=5, pady=5)  # 恢复大面板
+
 
 class MinimapSelector(tk.Toplevel):
     def __init__(self, master):
@@ -1478,8 +2241,8 @@ class MinimapSelector(tk.Toplevel):
         self.geometry(f"{self.size}x{self.size}+{self.x}+{self.y}")
 
         # --- 创建画布 ---
-        self.canvas = tk.Canvas(self, bg='black', highlightthickness=0)
-        self.canvas.pack(fill=tk.BOTH, expand=True)
+        self.canvas = ctk.CTkCanvas(self, bg='black', highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
 
         self.draw_ui()
 
@@ -1633,28 +2396,6 @@ class MinimapSelector(tk.Toplevel):
             "height": real_height
         }
 
-        # # 2. 写入配置文件
-        # config_data = {}
-        # if os.path.exists(CONFIG_FILE):
-        #     try:
-        #         with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-        #             config_data = json.load(f)
-        #     except Exception:
-        #         pass
-        #
-        # config_data["MINIMAP"] = {
-        #     "top": real_top,
-        #     "left": real_left,
-        #     "width": real_width,
-        #     "height": real_height
-        # }
-
-
-
-        # 不保存，避免windows缩放导致的错误
-        # with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-        #     json.dump(config_data, f, indent=4, ensure_ascii=False)
-
         log_step(f"✅ 坐标锁定成功! 物理位置: ({real_left}, {real_top}) 大小: {real_width}x{real_height}")
         self.destroy()
 
@@ -1664,20 +2405,80 @@ def log_step(step_name):
     with open("log.txt", "a", encoding="utf-8") as f:
         f.write(step_info)
 
+
+def show_welcome_popup(parent):
+    popup = ctk.CTkToplevel(parent)
+    popup.title(f"LKMT工具，{group_text}")
+    target_width = 600
+    target_height = 350
+    # 保持在最上层
+    popup.attributes("-topmost", True)
+
+    # 居中显示
+    popup.update_idletasks()
+    width = popup.winfo_width()
+    height = popup.winfo_height()
+    screen_width = popup.winfo_screenwidth()
+    screen_height = popup.winfo_screenheight()
+    x = (screen_width // 2) - (width // 2)
+    y = (screen_height // 2) - (height // 2)
+    popup.geometry(f"{target_width}x{target_height}+{x}+{y}")
+    popup.deiconify()
+    popup.resizable(False, False)
+
+    # ---------------- 占位文本区域 ----------------
+    placeholder_text = (
+        "欢迎使用LKMT工具\n\n"
+        "本工具获取途径（github 夸克网盘）完全免费\n"
+        "如果是从他人渠道购买得到下载地址，您这是被骗啦！\n"
+        f"{group_text}\n\n"
+        "※ 请点击下方按钮或关闭本窗口以继续运行程序。"
+    )
+    # ---------------------------------------------
+
+    # UI 布局
+    frame = ctk.CTkFrame(popup, corner_radius=10)
+    frame.pack(fill=ctk.BOTH, expand=True, padx=20, pady=(20, 10))
+
+    lbl = ctk.CTkLabel(
+        frame,
+        text=placeholder_text,
+        justify=tk.LEFT,
+        font=("微软雅黑", 17),
+        wraplength=target_width - 100
+    )
+    lbl.pack(fill=ctk.BOTH, expand=True, padx=15, pady=15)
+
+    btn = ctk.CTkButton(
+        popup,
+        text="我已知晓",
+        width=120,
+        height=35,
+        command=popup.destroy
+    )
+    btn.pack(pady=20)
+
+    # 阻塞
+    popup.grab_set()
+    parent.wait_window(popup)
+
 def run_bootstrapper(force_selector=True):
-    root = tk.Tk()
-    root.withdraw()
+    root = ctk.CTk()
+    root.geometry(WINDOW_GEOMETRY)
+    root.columnconfigure(0, weight=1)
+    root.rowconfigure(0, weight=1)
+
+    log_step("正在显示启动弹窗")
+    show_welcome_popup(root)
 
     # 检查配置是否存在
     log_step("正在检测是否需要小地图选择器")
     needs_selector = not MINIMAP_DATA or force_selector
     if needs_selector:
         log_step("正在创建选择器UI")
-        # 2. 创建一个临时的 Toplevel 运行选择器
         selector_app = MinimapSelector(root)
 
-        # --- 核心：阻塞逻辑 ---
-        # 告诉 Tkinter，在这里停住，直到 selector_win 被销毁
+        # 阻塞Tkinter直到 selector_win 被销毁
         root.wait_window(selector_app)
 
         log_step("选择器检查完成")
@@ -1688,12 +2489,14 @@ def run_bootstrapper(force_selector=True):
             root.destroy()
             sys.exit()
 
-    # 因为配置文件被 selector 修改了，我们需要重新加载一次 config 模块的数据
+    # 重载config
     import importlib
     importlib.reload(config)
 
     log_step("显示主窗口")
     root.deiconify()  # 重新显示主窗口
+    root.update()
+
     app = MapTrackerApp(root)
     root.mainloop()
 
@@ -1707,7 +2510,7 @@ if __name__ == "__main__":
     import multiprocessing
     multiprocessing.freeze_support()
 
-    log_step("程序启动")
+    log_step(f"程序启动，欢迎使用LKMT工具，本工具获取途径完全免费，{group_text}")
 
     if MATCHTYPE not in ["FLANN","BF"]:
         MATCHTYPE = "BF"

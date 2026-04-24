@@ -36,3 +36,8 @@ dist/
 log.txt
 crash_log.txt
 *.txt
+
+#忽略自定义配置文件
+user_points.json
+picking_data.json
+points.json
