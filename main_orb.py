@@ -151,7 +151,7 @@ class BigMapWindow(ctk.CTkToplevel):
             self.offset_y = (800 - self.orig_h * self.scale) / 2
 
         # === 顶部 UI 区域
-        self.top_frame = ctk.CTkFrame(self, height=40, corner_radius=0, fg_color="#2b2b2b")
+        self.top_frame = ctk.CTkFrame(self, height=40, corner_radius=0, fg_color="#FFFFFF")
         self.top_frame.pack(side=tk.TOP, fill=tk.X)
 
         self.btn_save_points = ctk.CTkButton(self.top_frame, text="保存标点", width=80, command=self.save_custom_points)
@@ -174,6 +174,10 @@ class BigMapWindow(ctk.CTkToplevel):
                                               command=self.on_view_route_change)
         self.cmb_view_route.pack(side=tk.LEFT, padx=5, pady=5)
 
+        self.realtime_update_var = ctk.BooleanVar(value=False)
+        self.chk_realtime = ctk.CTkCheckBox(self.top_frame, text="开启实时更新*此选项会消耗性能*", variable=self.realtime_update_var)
+        self.chk_realtime.pack(side=tk.LEFT, padx=15, pady=5)
+
         self.canvas = tk.Canvas(self, bg='#1a1a1a', cursor="fleur")
         self.canvas.pack(fill=ctk.BOTH, expand=True)
 
@@ -190,8 +194,12 @@ class BigMapWindow(ctk.CTkToplevel):
         self.bind("<R>", self.toggle_route_mode)
         self.canvas.bind("<Button-1>", self.on_left_click, add="+")
         self.bind("<Configure>", lambda e: self.render())
+        self.bind("<Control-z>", self.undo_last_route_node)
+        self.bind("<Control-Z>", self.undo_last_route_node)
 
-        self.after(300, self.render)
+        self.after(300, self.realtime_data_loop)
+        # self.after(300, self.render)
+
 
     def on_show_custom_toggle(self):
         """切换底图版本：是否隐藏系统标点"""
@@ -473,6 +481,16 @@ class BigMapWindow(ctk.CTkToplevel):
 
         self.canvas.tag_raise("custom_marker")
 
+        # 绘制大地图上的玩家位置指示器
+        self.canvas.delete("bigmap_player")  # 先清除旧的
+        if self.parent_app and getattr(self.parent_app, 'smooth_x', None) is not None:
+            px, py = self.get_canvas_coords(self.parent_app.smooth_x, self.parent_app.smooth_y)
+
+            # 画一个带白边的红心圆作为玩家位置指示
+            self.canvas.create_oval(px - 7, py - 7, px + 7, py + 7, fill="red", outline="white", width=2,
+                                    tags="bigmap_player")
+            self.canvas.tag_raise("bigmap_player")
+
     def on_right_click(self, event):
         if self.is_route_mode: return
 
@@ -550,7 +568,6 @@ class BigMapWindow(ctk.CTkToplevel):
 
         # 遍历程序启动时已经加载好的 icon_cache
         for icon_name, icon_data in self.icon_cache.items():
-            # 使用标准 tk.Button 因为它与 ImageTk.PhotoImage 兼容性完美
             # 背景色设为深色以契合夜间模式
             btn = tk.Button(
                 scroll_frame,
@@ -678,6 +695,51 @@ class BigMapWindow(ctk.CTkToplevel):
         if self.parent_app:
             self.parent_app.refresh_route_list()
 
+    def undo_last_route_node(self, event=None):
+        """撤回上一步绘制的路线节点 (Ctrl+Z)"""
+        # 仅在路线模式下生效
+        if not self.is_route_mode:
+            return
+
+        # 如果当前没有任何节点，直接返回
+        if not self.current_route_nodes:
+            return
+
+        # 1. 弹出并删除最后一个节点的绿色高亮圈
+        last_node = self.current_route_nodes.pop()
+        if 'highlight_id' in last_node:
+            self.canvas.delete(last_node['highlight_id'])
+
+        # 2. 如果存在与之相连的黄色虚线，也弹出并删除
+        if self.temp_route_lines:
+            last_line = self.temp_route_lines.pop()
+            self.canvas.delete(last_line)
+
+    def realtime_data_loop(self):
+        """循环检测并实时刷新标点状态和玩家位置 (不锁定视角)"""
+        if not hasattr(self, 'canvas') or not self.canvas.winfo_exists():
+            return
+
+        # 仅当勾选了实时更新，并且当前没有在拖拽大地图时，才进行刷新计算
+        if self.realtime_update_var.get() and not getattr(self, 'is_dragging', False):
+            # 刷新底图上的系统自带标点（如果开启了自动采集，主程序的 marker_data 里的 is_collected 会变 True）
+            if not self.show_only_custom_var.get():
+                self.baked_system_img = self.bake_static_map() # 重新烘焙底图，灰色图标会生效
+                self.baked_full_image = self.baked_system_img
+                # 更新缩略图缓存
+                if self.thumb_scale_factor < 1.0:
+                     self.system_thumbnail_img = self.baked_system_img.resize(
+                         (int(self.orig_w * self.thumb_scale_factor), int(self.orig_h * self.thumb_scale_factor)),
+                         Image.Resampling.NEAREST)
+                     self.thumbnail_img = self.system_thumbnail_img
+                else:
+                     self.thumbnail_img = self.baked_system_img
+
+            # 触发一次完整的 render
+            self.render()
+
+        # 每 200 毫秒（一秒5次）检测一次即可
+        self.after(200, self.realtime_data_loop)
 
 
 class MapTrackerApp:
@@ -2281,14 +2343,14 @@ class MinimapSelector(tk.Toplevel):
         self.canvas.delete("all")
         w = 3  # 边框厚度
 
-        # 1. 绘制表示小地图边界的绿色圆圈
+        # 绘制表示小地图边界的绿色圆圈
         self.canvas.create_oval(w, w, self.size - w, self.size - w, outline="#00FF00", width=w)
 
-        # 2. 绘制十字准星中心辅助线
+        # 绘制十字准星中心辅助线
         self.canvas.create_line(0, self.size // 2, self.size, self.size // 2, fill="#00FF00", dash=(4, 4))
         self.canvas.create_line(self.size // 2, 0, self.size // 2, self.size, fill="#00FF00", dash=(4, 4))
 
-        # 3. 绘制操作提示文字
+        # 绘制操作提示文字
         self.canvas.create_text(self.size // 2, 15, text="左键拖动 | 滚轮缩放\n圆框一定要比小地图的框要小", fill="white",
                                 font=("Microsoft YaHei", 9, "bold"))
         self.canvas.create_text(self.size // 2, self.size - 15, text="按 回车/双击 保存", fill="yellow",
